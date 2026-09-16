@@ -1,0 +1,16 @@
+{
+  "name": "script-panel-bot",
+  "version": "1.0.0",
+  "description": "Bot Discord panel de distribution de script (clé auto par rôle + redeem)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "verify-server": "node server.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
