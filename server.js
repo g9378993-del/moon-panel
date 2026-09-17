@@ -32,10 +32,28 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 // Sert le script obfusqué : c'est CETTE url que le loader court livré à
 // l'acheteur va appeler via game:HttpGet(...). Le nom de fichier est un
 // hash aléatoire non-devinable généré à la création du produit.
+// La clé (?key=...) est vérifiée à CHAQUE appel : si l'acheteur est
+// blacklist, si la clé a expiré, ou si le killswitch est actif, le script
+// n'est plus servi — donc plus utilisable dans Roblox dès le prochain
+// lancement.
 app.get('/scripts/hosted/:filename', (req, res) => {
   const products = loadJson(PRODUCTS_PATH, {});
-  const product = Object.values(products).find((p) => p.hostedFilename === req.params.filename);
-  if (!product) return res.status(404).send('-- not found');
+  const [productId, product] = Object.entries(products).find(([, p]) => p.hostedFilename === req.params.filename) || [];
+  if (!product) return res.type('text/plain').send('-- not found');
+
+  const keyValue = String(req.query.key || '').trim().toUpperCase();
+  const keys = loadJson(KEYS_PATH, []);
+  const record = keys.find((k) => k.key === keyValue && k.productId === productId);
+  if (!record) return res.type('text/plain').send('-- access denied: invalid key');
+
+  const blacklist = loadJson(BLACKLIST_PATH, {});
+  if (record.userId && blacklist[record.userId]) return res.type('text/plain').send('-- access denied: blacklisted');
+
+  const config = loadJson(CONFIG_PATH, {});
+  if (config.killswitchGlobal || product.killswitch) return res.type('text/plain').send('-- access denied: disabled');
+
+  if (record.expiresAt && Date.now() > record.expiresAt) return res.type('text/plain').send('-- access denied: expired');
+
   res.type('text/plain').send(product.script || '-- empty');
 });
 

@@ -16,6 +16,7 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  StringSelectMenuBuilder,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -105,20 +106,35 @@ function buildPanelEmbed() {
 function buildPanelButtons() {
   const config = loadConfig();
   const lang = config.language;
-  const row = new ActionRowBuilder();
+  const row1 = new ActionRowBuilder();
+  const row2 = new ActionRowBuilder();
 
   if (config.panelButtons.includes('key_get')) {
-    row.addComponents(new ButtonBuilder().setCustomId('key_get').setLabel(t(lang, 'btn_get_keys')).setEmoji('🔑').setStyle(ButtonStyle.Primary));
+    row1.addComponents(new ButtonBuilder().setCustomId('key_get').setLabel(t(lang, 'btn_get_keys')).setEmoji('🔑').setStyle(ButtonStyle.Primary));
   }
 
   const redeemLabel = t(lang, 'btn_get_script');
-  row.addComponents(new ButtonBuilder().setCustomId('key_redeem').setLabel(redeemLabel).setEmoji('📥').setStyle(ButtonStyle.Success));
+  row1.addComponents(new ButtonBuilder().setCustomId('key_redeem').setLabel(redeemLabel).setEmoji('📥').setStyle(ButtonStyle.Success));
 
-  if (config.panelButtons.includes('reset_hwid')) {
-    row.addComponents(new ButtonBuilder().setCustomId('reset_hwid').setLabel(t(lang, 'btn_reset_hwid')).setEmoji('🔄').setStyle(ButtonStyle.Secondary));
+  if (config.panelButtons.includes('view_script')) {
+    row1.addComponents(new ButtonBuilder().setCustomId('view_script').setLabel(t(lang, 'btn_view_script')).setEmoji('📜').setStyle(ButtonStyle.Primary));
   }
 
-  return [row];
+  if (config.panelButtons.includes('key_info')) {
+    row2.addComponents(new ButtonBuilder().setCustomId('key_info').setLabel(t(lang, 'btn_key_info')).setEmoji('📊').setStyle(ButtonStyle.Secondary));
+  }
+
+  if (config.panelButtons.includes('get_buyer_role')) {
+    row2.addComponents(new ButtonBuilder().setCustomId('get_buyer_role').setLabel(t(lang, 'btn_get_buyer_role')).setEmoji('👤').setStyle(ButtonStyle.Secondary));
+  }
+
+  if (config.panelButtons.includes('reset_hwid')) {
+    row2.addComponents(new ButtonBuilder().setCustomId('reset_hwid').setLabel(t(lang, 'btn_reset_hwid')).setEmoji('🔄').setStyle(ButtonStyle.Danger));
+  }
+
+  const rows = [row1];
+  if (row2.components.length > 0) rows.push(row2);
+  return rows;
 }
 
 // ----------------------------------------------------------------
@@ -198,7 +214,7 @@ function buildHostedLoader(record, product) {
   return [
     `script_key = "${record.key}"`,
     '',
-    `loadstring(game:HttpGet("${base.replace(/\/$/, '')}/scripts/hosted/${product.hostedFilename}"))()`,
+    `loadstring(game:HttpGet("${base.replace(/\/$/, '')}/scripts/hosted/${product.hostedFilename}?key=${record.key}"))()`,
   ].join('\n');
 }
 
@@ -343,13 +359,25 @@ const commands = [
     .setName('addbutton')
     .setDescription('(Admin) Ajoute un bouton optionnel au panel')
     .addStringOption((o) => o.setName('bouton').setDescription('Le bouton').setRequired(true)
-      .addChoices({ name: 'Obtenir mes clés', value: 'key_get' }, { name: 'Reset HWID', value: 'reset_hwid' })),
+      .addChoices(
+        { name: 'Obtenir mes clés', value: 'key_get' },
+        { name: 'View Script (déjà possédée)', value: 'view_script' },
+        { name: 'Key Info', value: 'key_info' },
+        { name: 'Get Buyer Role', value: 'get_buyer_role' },
+        { name: 'Reset HWID', value: 'reset_hwid' },
+      )),
 
   new SlashCommandBuilder()
     .setName('removebutton')
     .setDescription('(Admin) Retire un bouton optionnel du panel')
     .addStringOption((o) => o.setName('bouton').setDescription('Le bouton').setRequired(true)
-      .addChoices({ name: 'Obtenir mes clés', value: 'key_get' }, { name: 'Reset HWID', value: 'reset_hwid' })),
+      .addChoices(
+        { name: 'Obtenir mes clés', value: 'key_get' },
+        { name: 'View Script (déjà possédée)', value: 'view_script' },
+        { name: 'Key Info', value: 'key_info' },
+        { name: 'Get Buyer Role', value: 'get_buyer_role' },
+        { name: 'Reset HWID', value: 'reset_hwid' },
+      )),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
@@ -803,6 +831,69 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (interaction.customId === 'view_script') {
+        await interaction.deferReply({ ephemeral: true });
+        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+        const keys = loadKeys();
+        const owned = findKeysByUser(keys, interaction.user.id);
+        if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
+
+        if (owned.length === 1) {
+          const deliveryRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`deliver_dm_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`deliver_here_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary)
+          );
+          await interaction.editReply({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
+          return;
+        }
+
+        const products = loadProducts();
+        const select = new StringSelectMenuBuilder().setCustomId('select_view_script').setPlaceholder(t(lang, 'select_product_placeholder'))
+          .addOptions(owned.slice(0, 25).map((k) => ({ label: products[k.productId]?.name || k.productId, value: k.key })));
+        await interaction.editReply({ components: [new ActionRowBuilder().addComponents(select)] });
+        return;
+      }
+
+      if (interaction.customId === 'key_info') {
+        await interaction.deferReply({ ephemeral: true });
+        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+        const keys = loadKeys();
+        const owned = findKeysByUser(keys, interaction.user.id);
+        if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
+        const products = loadProducts();
+        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(t(lang, 'key_info_title'));
+        for (const k of owned) {
+          embed.addFields({
+            name: products[k.productId]?.name || k.productId,
+            value: `HWID: ${k.hwid ? '✅' : '—'} | Expire: ${k.expiresAt ? fmtDate(k.expiresAt) : 'Jamais'} | ${k.redeemedAt ? 'Utilisée' : 'Non utilisée'}`,
+          });
+        }
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (interaction.customId === 'get_buyer_role') {
+        await interaction.deferReply({ ephemeral: true });
+        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+        const roleMap = loadRoleMap();
+        const entries = Object.entries(roleMap);
+        if (entries.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_role_configured') }); return; }
+
+        if (entries.length === 1) {
+          const [roleId] = entries[0];
+          if (interaction.member.roles.cache.has(roleId)) { await interaction.editReply({ content: t(lang, 'msg_role_already') }); return; }
+          await interaction.member.roles.add(roleId);
+          await interaction.editReply({ content: t(lang, 'msg_role_granted') });
+          return;
+        }
+
+        const products = loadProducts();
+        const select = new StringSelectMenuBuilder().setCustomId('select_buyer_role').setPlaceholder(t(lang, 'select_product_placeholder'))
+          .addOptions(entries.slice(0, 25).map(([roleId, productId]) => ({ label: products[productId]?.name || productId, value: roleId })));
+        await interaction.editReply({ components: [new ActionRowBuilder().addComponents(select)] });
+        return;
+      }
+
       // deliver_dm_<clé> / deliver_here_<clé> : choix fait par l'acheteur
       // après avoir validé sa clé dans le modal de redeem.
       if (interaction.customId.startsWith('deliver_dm_') || interaction.customId.startsWith('deliver_here_')) {
@@ -830,6 +921,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.editReply({ content: sent ? t(lang, 'msg_script_sent_dm') : t(lang, 'msg_dm_failed'), components: [] });
         } else {
           await interaction.editReply({ content: `\`\`\`lua\n${loaderSnippet}\n\`\`\``, components: [] });
+        }
+        return;
+      }
+    }
+
+    // --- Menus déroulants (choix d'un produit parmi plusieurs) ---
+    if (interaction.isStringSelectMenu()) {
+      const blacklist = loadBlacklist();
+      const config = loadConfig();
+      const lang = config.language;
+      if (blacklist[interaction.user.id]) { await interaction.update({ content: t(lang, 'msg_blacklisted'), components: [] }); return; }
+
+      if (interaction.customId === 'select_view_script') {
+        const keyValue = interaction.values[0];
+        const deliveryRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`deliver_dm_${keyValue}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`deliver_here_${keyValue}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.update({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
+        return;
+      }
+
+      if (interaction.customId === 'select_buyer_role') {
+        const roleId = interaction.values[0];
+        if (interaction.member.roles.cache.has(roleId)) { await interaction.update({ content: t(lang, 'msg_role_already'), components: [] }); return; }
+        try {
+          await interaction.member.roles.add(roleId);
+          await interaction.update({ content: t(lang, 'msg_role_granted'), components: [] });
+        } catch (e) {
+          await interaction.update({ content: "❌ Impossible d'ajouter le rôle.", components: [] });
         }
         return;
       }
