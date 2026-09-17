@@ -38,6 +38,7 @@ const PRODUCTS_PATH = path.join(DATA_DIR, 'products.json');
 const ROLEMAP_PATH = path.join(DATA_DIR, 'roleMap.json');
 const BLACKLIST_PATH = path.join(DATA_DIR, 'blacklist.json');
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
+const PANELS_PATH = path.join(DATA_DIR, 'panels.json');
 
 const DEFAULT_CONFIG = {
   killswitchGlobal: false,
@@ -48,6 +49,7 @@ const DEFAULT_CONFIG = {
   panelFooter: 'Made by aln',
   language: 'en',
   panelButtons: ['key_get', 'reset_hwid'], // le bouton clé/script est toujours présent en plus
+  buttonEmojis: { key_get: '🔑', key_redeem: '📥', view_script: '📜', key_info: '📊', get_buyer_role: '👤', reset_hwid: '🔄' },
 };
 
 function loadJson(p, fallback) {
@@ -66,6 +68,8 @@ function loadBlacklist() { return loadJson(BLACKLIST_PATH, {}); }
 function saveBlacklist(d) { saveJson(BLACKLIST_PATH, d); }
 function loadConfig() { return { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) }; }
 function saveConfig(d) { saveJson(CONFIG_PATH, d); }
+function loadPanels() { return loadJson(PANELS_PATH, []); }
+function savePanels(d) { saveJson(PANELS_PATH, d); }
 
 function slugify(name) {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'produit';
@@ -106,35 +110,78 @@ function buildPanelEmbed() {
 function buildPanelButtons() {
   const config = loadConfig();
   const lang = config.language;
+  const emo = (id, fallback) => config.buttonEmojis?.[id] || fallback;
   const row1 = new ActionRowBuilder();
   const row2 = new ActionRowBuilder();
 
   if (config.panelButtons.includes('key_get')) {
-    row1.addComponents(new ButtonBuilder().setCustomId('key_get').setLabel(t(lang, 'btn_get_keys')).setEmoji('🔑').setStyle(ButtonStyle.Primary));
+    row1.addComponents(new ButtonBuilder().setCustomId('key_get').setLabel(t(lang, 'btn_get_keys')).setEmoji(emo('key_get', '🔑')).setStyle(ButtonStyle.Primary));
   }
 
   const redeemLabel = t(lang, 'btn_get_script');
-  row1.addComponents(new ButtonBuilder().setCustomId('key_redeem').setLabel(redeemLabel).setEmoji('📥').setStyle(ButtonStyle.Success));
+  row1.addComponents(new ButtonBuilder().setCustomId('key_redeem').setLabel(redeemLabel).setEmoji(emo('key_redeem', '📥')).setStyle(ButtonStyle.Success));
 
   if (config.panelButtons.includes('view_script')) {
-    row1.addComponents(new ButtonBuilder().setCustomId('view_script').setLabel(t(lang, 'btn_view_script')).setEmoji('📜').setStyle(ButtonStyle.Primary));
+    row1.addComponents(new ButtonBuilder().setCustomId('view_script').setLabel(t(lang, 'btn_view_script')).setEmoji(emo('view_script', '📜')).setStyle(ButtonStyle.Primary));
   }
 
   if (config.panelButtons.includes('key_info')) {
-    row2.addComponents(new ButtonBuilder().setCustomId('key_info').setLabel(t(lang, 'btn_key_info')).setEmoji('📊').setStyle(ButtonStyle.Secondary));
+    row2.addComponents(new ButtonBuilder().setCustomId('key_info').setLabel(t(lang, 'btn_key_info')).setEmoji(emo('key_info', '📊')).setStyle(ButtonStyle.Secondary));
   }
 
   if (config.panelButtons.includes('get_buyer_role')) {
-    row2.addComponents(new ButtonBuilder().setCustomId('get_buyer_role').setLabel(t(lang, 'btn_get_buyer_role')).setEmoji('👤').setStyle(ButtonStyle.Secondary));
+    row2.addComponents(new ButtonBuilder().setCustomId('get_buyer_role').setLabel(t(lang, 'btn_get_buyer_role')).setEmoji(emo('get_buyer_role', '👤')).setStyle(ButtonStyle.Secondary));
   }
 
   if (config.panelButtons.includes('reset_hwid')) {
-    row2.addComponents(new ButtonBuilder().setCustomId('reset_hwid').setLabel(t(lang, 'btn_reset_hwid')).setEmoji('🔄').setStyle(ButtonStyle.Danger));
+    row2.addComponents(new ButtonBuilder().setCustomId('reset_hwid').setLabel(t(lang, 'btn_reset_hwid')).setEmoji(emo('reset_hwid', '🔄')).setStyle(ButtonStyle.Danger));
   }
 
   const rows = [row1];
   if (row2.components.length > 0) rows.push(row2);
   return rows;
+}
+
+// ----------------------------------------------------------------
+// SUIVI DES PANELS PUBLIÉS (pour les mettre à jour automatiquement)
+// ----------------------------------------------------------------
+function trackPanel(message) {
+  const panels = loadPanels();
+  panels.push({ messageId: message.id, channelId: message.channelId, createdAt: Date.now() });
+  savePanels(panels);
+}
+
+async function updatePanelByRecord(record) {
+  try {
+    const channel = await client.channels.fetch(record.channelId);
+    const message = await channel.messages.fetch(record.messageId);
+    await message.edit({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
+    return true;
+  } catch (e) {
+    savePanels(loadPanels().filter((p) => p.messageId !== record.messageId));
+    return false;
+  }
+}
+
+// Appelée après toute commande qui change l'apparence du panel. Si un seul
+// panel existe, il est mis à jour automatiquement. S'il y en a plusieurs,
+// on demande lequel via des boutons.
+async function offerPanelUpdate(interaction) {
+  const panels = loadPanels();
+  if (panels.length === 0) return;
+  if (panels.length === 1) {
+    await updatePanelByRecord(panels[0]);
+    return;
+  }
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('panelupdate_latest').setLabel('Le plus récent').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('panelupdate_pick').setLabel('Choisir lequel').setStyle(ButtonStyle.Secondary)
+  );
+  await interaction.followUp({
+    content: `Plusieurs panels existent (${panels.length}). Veux-tu mettre à jour le plus récent, ou choisir lequel ?`,
+    components: [row],
+    ephemeral: true,
+  });
 }
 
 // ----------------------------------------------------------------
@@ -378,6 +425,20 @@ const commands = [
         { name: 'Get Buyer Role', value: 'get_buyer_role' },
         { name: 'Reset HWID', value: 'reset_hwid' },
       )),
+
+  new SlashCommandBuilder()
+    .setName('setemoji')
+    .setDescription("(Admin) Change l'emoji d'un bouton du panel")
+    .addStringOption((o) => o.setName('bouton').setDescription('Le bouton').setRequired(true)
+      .addChoices(
+        { name: 'Obtenir mes clés', value: 'key_get' },
+        { name: 'Redeem/Get Script (bouton principal)', value: 'key_redeem' },
+        { name: 'View Script', value: 'view_script' },
+        { name: 'Key Info', value: 'key_info' },
+        { name: 'Get Buyer Role', value: 'get_buyer_role' },
+        { name: 'Reset HWID', value: 'reset_hwid' },
+      ))
+    .addStringOption((o) => o.setName('emoji').setDescription('Le nouvel emoji, ex: 🔥').setRequired(true)),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
@@ -453,7 +514,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (cmd === 'panel') {
         await interaction.deferReply();
-        await interaction.editReply({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
+        const sentMessage = await interaction.editReply({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
+        trackPanel(sentMessage);
         return;
       }
 
@@ -490,7 +552,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               '**Produits** : `/addproduct` `/listproducts` `/removeproduct` `/setrole`',
               '**Clés** : `/genkey` `/whitelist` `/bulkgen` `/revokekey` `/deletekey` `/deleteuserkeys` `/lookupkey` `/lookupuser`',
               '**Sécurité** : `/resetkeyhwid` `/sethwidcooldown` `/killswitch` `/blacklist` `/unblacklist`',
-              '**Apparence** : `/setcolor` `/settitle` `/setdescription` `/setfooter` `/addbutton` `/removebutton`',
+              '**Apparence** : `/setcolor` `/settitle` `/setdescription` `/setfooter` `/addbutton` `/removebutton` `/setemoji`',
               '**Autre** : `/language` `/stats`',
             ].join('\n'),
           });
@@ -527,6 +589,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         for (const roleId of Object.keys(roleMap)) if (roleMap[roleId] === id) delete roleMap[roleId];
         saveRoleMap(roleMap);
         await interaction.editReply({ content: '✅ Produit supprimé.' });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -676,6 +739,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           config.killswitchGlobal = state;
           saveConfig(config);
           await interaction.editReply({ content: `✅ Killswitch global : ${state ? 'activé (tout bloqué)' : 'désactivé'}.` });
+          await offerPanelUpdate(interaction);
           return;
         }
         const products = loadProducts();
@@ -683,6 +747,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         products[productId].killswitch = state;
         saveProducts(products);
         await interaction.editReply({ content: `✅ ${products[productId].name} : ${state ? 'accès bloqué' : 'accès rétabli'}.` });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -731,6 +796,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         config.panelColor = parseInt(raw, 16);
         saveConfig(config);
         await interaction.editReply({ content: `✅ Couleur du panel changée en #${raw}.` });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -739,6 +805,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         config.panelTitle = interaction.options.getString('titre');
         saveConfig(config);
         await interaction.editReply({ content: '✅ Titre du panel mis à jour.' });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -747,6 +814,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         config.panelDescription = interaction.options.getString('texte');
         saveConfig(config);
         await interaction.editReply({ content: '✅ Description du panel mise à jour.' });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -755,6 +823,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         config.panelFooter = interaction.options.getString('texte');
         saveConfig(config);
         await interaction.editReply({ content: '✅ Pied de page du panel mis à jour.' });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -765,6 +834,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         saveConfig(config);
         const note = ['es', 'pt', 'de'].includes(langChoice) ? ' (traduction pas encore faite, affichera l\'anglais)' : '';
         await interaction.editReply({ content: `✅ Langue des acheteurs : ${langChoice}${note}.` });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -773,7 +843,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const config = loadConfig();
         if (!config.panelButtons.includes(btn)) config.panelButtons.push(btn);
         saveConfig(config);
-        await interaction.editReply({ content: `✅ Bouton ajouté au panel. Relance \`/panel\` pour voir le résultat.` });
+        await interaction.editReply({ content: `✅ Bouton ajouté au panel.` });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -782,7 +853,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const config = loadConfig();
         config.panelButtons = config.panelButtons.filter((b) => b !== btn);
         saveConfig(config);
-        await interaction.editReply({ content: `✅ Bouton retiré du panel. Relance \`/panel\` pour voir le résultat.` });
+        await interaction.editReply({ content: `✅ Bouton retiré du panel.` });
+        await offerPanelUpdate(interaction);
+        return;
+      }
+
+      if (cmd === 'setemoji') {
+        const btn = interaction.options.getString('bouton');
+        const emoji = interaction.options.getString('emoji');
+        const config = loadConfig();
+        config.buttonEmojis = { ...config.buttonEmojis, [btn]: emoji };
+        saveConfig(config);
+        await interaction.editReply({ content: `✅ Emoji mis à jour pour ce bouton : ${emoji}` });
+        await offerPanelUpdate(interaction);
         return;
       }
     }
@@ -924,6 +1007,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         return;
       }
+
+      if (interaction.customId === 'panelupdate_latest') {
+        await interaction.deferUpdate();
+        const panels = loadPanels().sort((a, b) => b.createdAt - a.createdAt);
+        if (panels.length === 0) { await interaction.editReply({ content: '❌ Plus aucun panel trouvé.', components: [] }); return; }
+        const ok = await updatePanelByRecord(panels[0]);
+        await interaction.editReply({ content: ok ? '✅ Panel le plus récent mis à jour.' : '❌ Ce panel est introuvable (supprimé ?).', components: [] });
+        return;
+      }
+
+      if (interaction.customId === 'panelupdate_pick') {
+        const panels = loadPanels().sort((a, b) => b.createdAt - a.createdAt).slice(0, 25);
+        const options = [];
+        for (const p of panels) {
+          let label = `Salon ${p.channelId}`;
+          try {
+            const ch = await client.channels.fetch(p.channelId);
+            label = `#${ch.name}`;
+          } catch (e) { /* salon supprimé, on garde le label par défaut */ }
+          options.push({ label: label.slice(0, 90), description: new Date(p.createdAt).toLocaleString('fr-FR'), value: JSON.stringify({ messageId: p.messageId, channelId: p.channelId }) });
+        }
+        const select = new StringSelectMenuBuilder().setCustomId('select_panel_update').setPlaceholder('Choisis un panel').addOptions(options);
+        await interaction.update({ content: 'Choisis quel panel mettre à jour :', components: [new ActionRowBuilder().addComponents(select)] });
+        return;
+      }
     }
 
     // --- Menus déroulants (choix d'un produit parmi plusieurs) ---
@@ -952,6 +1060,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         } catch (e) {
           await interaction.update({ content: "❌ Impossible d'ajouter le rôle.", components: [] });
         }
+        return;
+      }
+
+      if (interaction.customId === 'select_panel_update') {
+        await interaction.deferUpdate();
+        const record = JSON.parse(interaction.values[0]);
+        const ok = await updatePanelByRecord(record);
+        await interaction.editReply({ content: ok ? '✅ Panel mis à jour.' : '❌ Ce panel est introuvable (supprimé ?).', components: [] });
         return;
       }
     }
@@ -987,6 +1103,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         };
         saveProducts(products);
         await interaction.editReply({ content: `✅ Produit **${pending.name}** créé (id: \`${pending.id}\`) — script obfusqué automatiquement (Moon Obf).` });
+        await offerPanelUpdate(interaction);
         return;
       }
 
@@ -1061,3 +1178,15 @@ client.login(process.env.DISCORD_TOKEN);
 // dans le même programme, pour qu'ils partagent les mêmes données et que
 // l'hébergement (Render/Railway) reste tout-en-un.
 require('./server');
+
+// ----------------------------------------------------------------
+// ANTI-MISE EN VEILLE (plan gratuit Render)
+// ----------------------------------------------------------------
+// Render éteint le service après ~15 min sans requête HTTP entrante, ce qui
+// coupe aussi la connexion Discord du bot. On s'auto-appelle toutes les
+// 10 minutes pour que ça n'arrive jamais.
+if (process.env.PUBLIC_URL) {
+  setInterval(() => {
+    https.get(`${process.env.PUBLIC_URL.replace(/\/$/, '')}/health`, (res) => { res.resume(); }).on('error', () => {});
+  }, 10 * 60 * 1000);
+}
