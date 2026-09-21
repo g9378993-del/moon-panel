@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
+const db = require('./db');
 const { t, SUPPORTED_LANGS } = require('./lang');
 const { obfuscateScript } = require('./obfuscate');
 const {
@@ -58,18 +59,18 @@ function loadJson(p, fallback) {
 }
 function saveJson(p, data) { fs.writeFileSync(p, JSON.stringify(data, null, 2)); }
 
-function loadKeys() { return loadJson(KEYS_PATH, []); }
-function saveKeys(d) { saveJson(KEYS_PATH, d); }
-function loadProducts() { return loadJson(PRODUCTS_PATH, {}); }
-function saveProducts(d) { saveJson(PRODUCTS_PATH, d); }
-function loadRoleMap() { return loadJson(ROLEMAP_PATH, {}); }
-function saveRoleMap(d) { saveJson(ROLEMAP_PATH, d); }
-function loadBlacklist() { return loadJson(BLACKLIST_PATH, {}); }
-function saveBlacklist(d) { saveJson(BLACKLIST_PATH, d); }
-function loadConfig() { return { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) }; }
-function saveConfig(d) { saveJson(CONFIG_PATH, d); }
-function loadPanels() { return loadJson(PANELS_PATH, []); }
-function savePanels(d) { saveJson(PANELS_PATH, d); }
+function loadKeys() { return db.get('keys'); }
+function saveKeys(d) { db.set('keys', d); }
+function loadProducts() { return db.get('products'); }
+function saveProducts(d) { db.set('products', d); }
+function loadRoleMap() { return db.get('roleMap'); }
+function saveRoleMap(d) { db.set('roleMap', d); }
+function loadBlacklist() { return db.get('blacklist'); }
+function saveBlacklist(d) { db.set('blacklist', d); }
+function loadConfig() { return { ...DEFAULT_CONFIG, ...db.get('config') }; }
+function saveConfig(d) { db.set('config', d); }
+function loadPanels() { return db.get('panels'); }
+function savePanels(d) { db.set('panels', d); }
 
 function slugify(name) {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'produit';
@@ -163,22 +164,31 @@ async function updatePanelByRecord(record) {
   }
 }
 
-// Appelée après toute commande qui change l'apparence du panel. Si un seul
-// panel existe, il est mis à jour automatiquement. S'il y en a plusieurs,
-// on demande lequel via des boutons.
+// Appelée après toute commande qui change l'apparence du panel. Si aucun
+// panel n'existe encore, rien à faire (les prochains /panel utiliseront
+// les nouveaux réglages automatiquement). Sinon, on demande TOUJOURS quoi
+// faire — jamais de mise à jour silencieuse.
 async function offerPanelUpdate(interaction) {
   const panels = loadPanels();
   if (panels.length === 0) return;
+
+  const row = new ActionRowBuilder();
   if (panels.length === 1) {
-    await updatePanelByRecord(panels[0]);
-    return;
+    row.addComponents(
+      new ButtonBuilder().setCustomId('panelupdate_latest').setLabel('✅ Appliquer au panel existant').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('panelupdate_cancel').setLabel('Ne pas appliquer').setStyle(ButtonStyle.Secondary)
+    );
+  } else {
+    row.addComponents(
+      new ButtonBuilder().setCustomId('panelupdate_latest').setLabel('Le plus récent').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('panelupdate_pick').setLabel('Choisir lequel').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('panelupdate_cancel').setLabel('Ne pas appliquer').setStyle(ButtonStyle.Danger)
+    );
   }
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('panelupdate_latest').setLabel('Le plus récent').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('panelupdate_pick').setLabel('Choisir lequel').setStyle(ButtonStyle.Secondary)
-  );
   await interaction.followUp({
-    content: `Plusieurs panels existent (${panels.length}). Veux-tu mettre à jour le plus récent, ou choisir lequel ?`,
+    content: panels.length === 1
+      ? 'Un panel existe déjà. Veux-tu lui appliquer ce changement ?'
+      : `Plusieurs panels existent (${panels.length}). Lequel mettre à jour ?`,
     components: [row],
     ephemeral: true,
   });
@@ -228,6 +238,19 @@ function bulkGenerate(productId, quantity, { bypassStock = false } = {}) {
   }
   saveKeys(keys);
   return { keys: generated };
+}
+
+async function createProductFromScriptInput({ id, name, stock, expireDays, scriptInput }) {
+  const input = scriptInput.trim();
+  let rawContent = input;
+  if (/^https?:\/\//i.test(input)) {
+    rawContent = await fetchUrl(input); // peut lever une erreur, à catcher par l'appelant
+  }
+  const obfuscated = obfuscateScript(rawContent);
+  const hostedFilename = `${crypto.randomBytes(24).toString('hex')}.lua`;
+  const products = loadProducts();
+  products[id] = { name, script: obfuscated, rawScript: rawContent, hostedFilename, stock, expireDays, killswitch: false };
+  saveProducts(products);
 }
 
 async function dmUser(user, content) {
@@ -403,30 +426,6 @@ const commands = [
       )),
 
   new SlashCommandBuilder()
-    .setName('addbutton')
-    .setDescription('(Admin) Ajoute un bouton optionnel au panel')
-    .addStringOption((o) => o.setName('bouton').setDescription('Le bouton').setRequired(true)
-      .addChoices(
-        { name: 'Obtenir mes clés', value: 'key_get' },
-        { name: 'View Script (déjà possédée)', value: 'view_script' },
-        { name: 'Key Info', value: 'key_info' },
-        { name: 'Get Buyer Role', value: 'get_buyer_role' },
-        { name: 'Reset HWID', value: 'reset_hwid' },
-      )),
-
-  new SlashCommandBuilder()
-    .setName('removebutton')
-    .setDescription('(Admin) Retire un bouton optionnel du panel')
-    .addStringOption((o) => o.setName('bouton').setDescription('Le bouton').setRequired(true)
-      .addChoices(
-        { name: 'Obtenir mes clés', value: 'key_get' },
-        { name: 'View Script (déjà possédée)', value: 'view_script' },
-        { name: 'Key Info', value: 'key_info' },
-        { name: 'Get Buyer Role', value: 'get_buyer_role' },
-        { name: 'Reset HWID', value: 'reset_hwid' },
-      )),
-
-  new SlashCommandBuilder()
     .setName('setemoji')
     .setDescription("(Admin) Change l'emoji d'un bouton du panel")
     .addStringOption((o) => o.setName('bouton').setDescription('Le bouton').setRequired(true)
@@ -516,6 +515,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferReply();
         const sentMessage = await interaction.editReply({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
         trackPanel(sentMessage);
+
+        if (isAdmin) {
+          const config = loadConfig();
+          const buttonOptions = [
+            { label: 'Obtenir mes clés', value: 'key_get' },
+            { label: 'View Script', value: 'view_script' },
+            { label: 'Key Info', value: 'key_info' },
+            { label: 'Get Buyer Role', value: 'get_buyer_role' },
+            { label: 'Reset HWID', value: 'reset_hwid' },
+          ].map((o) => ({ ...o, default: config.panelButtons.includes(o.value) }));
+          const buttonSelect = new StringSelectMenuBuilder()
+            .setCustomId('select_panel_buttons')
+            .setPlaceholder('Choisis les boutons optionnels à afficher')
+            .setMinValues(0)
+            .setMaxValues(buttonOptions.length)
+            .addOptions(buttonOptions);
+          const addProductBtn = new ButtonBuilder().setCustomId('panel_setup_addproduct').setLabel('+ Ajouter un produit').setEmoji('📦').setStyle(ButtonStyle.Primary);
+          await interaction.followUp({
+            content: 'Configuration rapide du panel (facultatif) : choisis les boutons à afficher, et/ou ajoute un produit directement ici.',
+            components: [new ActionRowBuilder().addComponents(buttonSelect), new ActionRowBuilder().addComponents(addProductBtn)],
+            ephemeral: true,
+          });
+        }
         return;
       }
 
@@ -552,7 +574,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               '**Produits** : `/addproduct` `/listproducts` `/removeproduct` `/setrole`',
               '**Clés** : `/genkey` `/whitelist` `/bulkgen` `/revokekey` `/deletekey` `/deleteuserkeys` `/lookupkey` `/lookupuser`',
               '**Sécurité** : `/resetkeyhwid` `/sethwidcooldown` `/killswitch` `/blacklist` `/unblacklist`',
-              '**Apparence** : `/setcolor` `/settitle` `/setdescription` `/setfooter` `/addbutton` `/removebutton` `/setemoji`',
+              '**Apparence** : `/setcolor` `/settitle` `/setdescription` `/setfooter` `/setemoji` (boutons et produit se configurent via `/panel`)',
               '**Autre** : `/language` `/stats`',
             ].join('\n'),
           });
@@ -838,26 +860,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (cmd === 'addbutton') {
-        const btn = interaction.options.getString('bouton');
-        const config = loadConfig();
-        if (!config.panelButtons.includes(btn)) config.panelButtons.push(btn);
-        saveConfig(config);
-        await interaction.editReply({ content: `✅ Bouton ajouté au panel.` });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'removebutton') {
-        const btn = interaction.options.getString('bouton');
-        const config = loadConfig();
-        config.panelButtons = config.panelButtons.filter((b) => b !== btn);
-        saveConfig(config);
-        await interaction.editReply({ content: `✅ Bouton retiré du panel.` });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
       if (cmd === 'setemoji') {
         const btn = interaction.options.getString('bouton');
         const emoji = interaction.options.getString('emoji');
@@ -891,6 +893,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const modal = new ModalBuilder().setCustomId('modal_hwid_reset').setTitle(t(lang, 'modal_hwid_title'));
         const keyInput = new TextInputBuilder().setCustomId('key_value').setLabel(t(lang, 'modal_hwid_label')).setStyle(TextInputStyle.Short).setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(keyInput));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === 'panel_setup_addproduct') {
+        if (interaction.user.id !== process.env.OWNER_ID) { await interaction.reply({ content: '❌ Réservé aux administrateurs.', ephemeral: true }); return; }
+        const modal = new ModalBuilder().setCustomId('modal_quick_addproduct').setTitle('Ajouter un produit');
+        const nameInput = new TextInputBuilder().setCustomId('q_name').setLabel('Nom du produit').setStyle(TextInputStyle.Short).setRequired(true);
+        const stockInput = new TextInputBuilder().setCustomId('q_stock').setLabel('Stock max (0 = illimité)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('0');
+        const expireInput = new TextInputBuilder().setCustomId('q_expire').setLabel('Expiration en jours (0 = jamais)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('0');
+        const scriptInput = new TextInputBuilder().setCustomId('q_script').setLabel('Lien Pastebin/Pastefy (raw) ou code').setStyle(TextInputStyle.Paragraph).setRequired(true);
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(nameInput),
+          new ActionRowBuilder().addComponents(stockInput),
+          new ActionRowBuilder().addComponents(expireInput),
+          new ActionRowBuilder().addComponents(scriptInput)
+        );
         await interaction.showModal(modal);
         return;
       }
@@ -1032,6 +1051,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.update({ content: 'Choisis quel panel mettre à jour :', components: [new ActionRowBuilder().addComponents(select)] });
         return;
       }
+
+      if (interaction.customId === 'panelupdate_cancel') {
+        await interaction.update({ content: 'OK, rien n\'a été changé sur le(s) panel(s) existant(s).', components: [] });
+        return;
+      }
     }
 
     // --- Menus déroulants (choix d'un produit parmi plusieurs) ---
@@ -1040,6 +1064,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const config = loadConfig();
       const lang = config.language;
       if (blacklist[interaction.user.id]) { await interaction.update({ content: t(lang, 'msg_blacklisted'), components: [] }); return; }
+
+      if (interaction.customId === 'select_panel_buttons') {
+        if (interaction.user.id !== process.env.OWNER_ID) { await interaction.update({ content: '❌ Réservé aux administrateurs.', components: [] }); return; }
+        await interaction.deferUpdate();
+        const newConfig = loadConfig();
+        newConfig.panelButtons = interaction.values;
+        saveConfig(newConfig);
+        await interaction.editReply({
+          content: `✅ Boutons optionnels : ${interaction.values.length ? interaction.values.join(', ') : 'aucun'}.`,
+          components: interaction.message.components,
+        });
+        await offerPanelUpdate(interaction);
+        return;
+      }
 
       if (interaction.customId === 'select_view_script') {
         const keyValue = interaction.values[0];
@@ -1083,26 +1121,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
         pendingProducts.delete(interaction.user.id);
         if (!pending) { await interaction.editReply({ content: '❌ Session expirée, relance /addproduct.' }); return; }
 
-        const input = interaction.fields.getTextInputValue('script_content').trim();
-        let rawContent = input;
-        if (/^https?:\/\//i.test(input)) {
-          try {
-            rawContent = await fetchUrl(input);
-          } catch (e) {
-            await interaction.editReply({ content: `❌ Impossible de récupérer le lien (${e.message}). Vérifie que c'est bien un lien "raw".` });
-            return;
-          }
+        try {
+          await createProductFromScriptInput({
+            id: pending.id, name: pending.name, stock: pending.stock, expireDays: pending.expireDays,
+            scriptInput: interaction.fields.getTextInputValue('script_content'),
+          });
+        } catch (e) {
+          await interaction.editReply({ content: `❌ Impossible de récupérer le lien (${e.message}). Vérifie que c'est bien un lien "raw".` });
+          return;
         }
-
-        const obfuscated = obfuscateScript(rawContent);
-        const hostedFilename = `${crypto.randomBytes(24).toString('hex')}.lua`;
-        const products = loadProducts();
-        products[pending.id] = {
-          name: pending.name, script: obfuscated, rawScript: rawContent, hostedFilename,
-          stock: pending.stock, expireDays: pending.expireDays, killswitch: false,
-        };
-        saveProducts(products);
         await interaction.editReply({ content: `✅ Produit **${pending.name}** créé (id: \`${pending.id}\`) — script obfusqué automatiquement (Moon Obf).` });
+        await offerPanelUpdate(interaction);
+        return;
+      }
+
+      if (interaction.customId === 'modal_quick_addproduct') {
+        const name = interaction.fields.getTextInputValue('q_name').trim();
+        const stock = parseInt(interaction.fields.getTextInputValue('q_stock') || '0', 10) || 0;
+        const expireDays = parseInt(interaction.fields.getTextInputValue('q_expire') || '0', 10) || 0;
+        const id = slugify(name);
+
+        try {
+          await createProductFromScriptInput({ id, name, stock, expireDays, scriptInput: interaction.fields.getTextInputValue('q_script') });
+        } catch (e) {
+          await interaction.editReply({ content: `❌ Impossible de récupérer le lien (${e.message}). Vérifie que c'est bien un lien "raw".` });
+          return;
+        }
+        await interaction.editReply({ content: `✅ Produit **${name}** créé (id: \`${id}\`) — script obfusqué automatiquement (Moon Obf).` });
         await offerPanelUpdate(interaction);
         return;
       }
@@ -1172,21 +1217,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+(async () => {
+  await db.initDb();
 
-// Lance aussi le petit serveur web (vérification HWID + scripts hébergés)
-// dans le même programme, pour qu'ils partagent les mêmes données et que
-// l'hébergement (Render/Railway) reste tout-en-un.
-require('./server');
+  client.login(process.env.DISCORD_TOKEN);
 
-// ----------------------------------------------------------------
-// ANTI-MISE EN VEILLE (plan gratuit Render)
-// ----------------------------------------------------------------
-// Render éteint le service après ~15 min sans requête HTTP entrante, ce qui
-// coupe aussi la connexion Discord du bot. On s'auto-appelle toutes les
-// 10 minutes pour que ça n'arrive jamais.
-if (process.env.PUBLIC_URL) {
-  setInterval(() => {
-    https.get(`${process.env.PUBLIC_URL.replace(/\/$/, '')}/health`, (res) => { res.resume(); }).on('error', () => {});
-  }, 10 * 60 * 1000);
-}
+  // Lance aussi le petit serveur web (vérification HWID + scripts hébergés)
+  // dans le même programme, pour qu'ils partagent les mêmes données et que
+  // l'hébergement (Render/Railway) reste tout-en-un.
+  require('./server');
+
+  // ----------------------------------------------------------------
+  // ANTI-MISE EN VEILLE (plan gratuit Render)
+  // ----------------------------------------------------------------
+  // Render éteint le service après ~15 min sans requête HTTP entrante, ce
+  // qui coupe aussi la connexion Discord du bot. On s'auto-appelle toutes
+  // les 10 minutes pour que ça n'arrive jamais.
+  if (process.env.PUBLIC_URL) {
+    setInterval(() => {
+      https.get(`${process.env.PUBLIC_URL.replace(/\/$/, '')}/health`, (res) => { res.resume(); }).on('error', () => {});
+    }, 10 * 60 * 1000);
+  }
+})();

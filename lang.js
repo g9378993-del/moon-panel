@@ -5,7 +5,7 @@
 const en = {
   btn_get_keys: 'Get my keys',
   btn_redeem: 'Redeem a key',
-  btn_get_script: '🎁 Get Script',
+  btn_get_script: 'Get Script',
   btn_reset_hwid: 'Reset HWID',
   btn_view_script: 'View Script',
   btn_key_info: 'Key Info',
@@ -44,7 +44,7 @@ const en = {
 const fr = {
   btn_get_keys: 'Obtenir mes clés',
   btn_redeem: 'Utiliser une clé',
-  btn_get_script: '🎁 Get Script',
+  btn_get_script: 'Get Script',
   btn_reset_hwid: 'Réinitialiser HWID',
   btn_view_script: 'View Script',
   btn_key_info: 'Key Info',
