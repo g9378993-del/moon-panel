@@ -157,10 +157,15 @@ async function updatePanelByRecord(record) {
     const channel = await client.channels.fetch(record.channelId);
     const message = await channel.messages.fetch(record.messageId);
     await message.edit({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
-    return true;
+    return { ok: true };
   } catch (e) {
-    savePanels(loadPanels().filter((p) => p.messageId !== record.messageId));
-    return false;
+    console.error('Erreur mise à jour panel :', e.code || '', e.message);
+    // On ne retire le panel du suivi que s'il a vraiment disparu (message
+    // ou salon supprimé). Pour toute autre erreur (permissions, réseau...),
+    // on le garde en suivi et on remonte le vrai message d'erreur.
+    const reallyGone = e.code === 10008 || e.code === 10003;
+    if (reallyGone) savePanels(loadPanels().filter((p) => p.messageId !== record.messageId));
+    return { ok: false, reason: reallyGone ? 'gone' : (e.message || 'inconnue') };
   }
 }
 
@@ -1031,8 +1036,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferUpdate();
         const panels = loadPanels().sort((a, b) => b.createdAt - a.createdAt);
         if (panels.length === 0) { await interaction.editReply({ content: '❌ Plus aucun panel trouvé.', components: [] }); return; }
-        const ok = await updatePanelByRecord(panels[0]);
-        await interaction.editReply({ content: ok ? '✅ Panel le plus récent mis à jour.' : '❌ Ce panel est introuvable (supprimé ?).', components: [] });
+        const result = await updatePanelByRecord(panels[0]);
+        await interaction.editReply({
+          content: result.ok ? '✅ Panel le plus récent mis à jour.' : `❌ Échec : ${result.reason === 'gone' ? 'ce panel a été supprimé.' : result.reason}`,
+          components: [],
+        });
         return;
       }
 
@@ -1104,8 +1112,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === 'select_panel_update') {
         await interaction.deferUpdate();
         const record = JSON.parse(interaction.values[0]);
-        const ok = await updatePanelByRecord(record);
-        await interaction.editReply({ content: ok ? '✅ Panel mis à jour.' : '❌ Ce panel est introuvable (supprimé ?).', components: [] });
+        const result = await updatePanelByRecord(record);
+        await interaction.editReply({
+          content: result.ok ? '✅ Panel mis à jour.' : `❌ Échec : ${result.reason === 'gone' ? 'ce panel a été supprimé.' : result.reason}`,
+          components: [],
+        });
         return;
       }
     }
