@@ -445,14 +445,21 @@ const commands = [
     .addStringOption((o) => o.setName('emoji').setDescription('Le nouvel emoji, ex: 🔥').setRequired(true)),
 ].map((c) => c.toJSON());
 
+// Commande globale (tous serveurs où le bot est présent), réservée à
+// OWNER_ID. Enregistrée séparément des autres pour être disponible partout.
+const ownerCommands = [
+  new SlashCommandBuilder().setName('ownerinfo').setDescription('Statistiques du bot (toi uniquement, dans tous les serveurs)'),
+].map((c) => c.toJSON());
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
     if (process.env.GUILD_ID) {
       await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
-      console.log('Commandes slash enregistrées (guild).');
+      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: ownerCommands });
+      console.log('Commandes slash enregistrées (guild + /ownerinfo en global).');
     } else {
-      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: [...commands, ...ownerCommands] });
       console.log('Commandes slash enregistrées (global).');
     }
   } catch (err) {
@@ -583,6 +590,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
               '**Autre** : `/language` `/stats`',
             ].join('\n'),
           });
+        }
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (cmd === 'ownerinfo') {
+        await interaction.deferReply({ ephemeral: true });
+        if (interaction.user.id !== process.env.OWNER_ID) {
+          await interaction.editReply({ content: '❌ Cette commande est réservée au propriétaire du bot.' });
+          return;
+        }
+        const guilds = [...client.guilds.cache.values()];
+        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(`📡 Ton bot est utilisé dans ${guilds.length} serveur(s)`);
+        for (const g of guilds.slice(0, 25)) {
+          embed.addFields({ name: g.name, value: `ID: ${g.id} | Membres: ${g.memberCount}`, inline: false });
         }
         await interaction.editReply({ embeds: [embed] });
         return;
