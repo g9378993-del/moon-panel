@@ -1,94 +1,120 @@
-// Petit serveur de vérification HWID.
-// C'est CE fichier que ton script Lua doit appeler (via HttpGet/HttpPost
-// selon ton executor) pour vérifier qu'une clé + un appareil sont valides.
-//
-// ⚠️ Pour que ça fonctionne depuis Roblox, ce serveur doit être accessible
-// depuis Internet avec une URL publique stable. Sur un téléphone (Termux),
-// ce n'est pas fiable (pas d'IP publique fixe, coupures). Héberge-le plutôt
-// sur Render.com ou Railway.app (gratuit pour commencer) — dis-moi si tu
-// veux le guide pour ça.
+// Petit serveur de vérification HWID + livraison du script hébergé.
+// C'est CE fichier que ton script Lua doit appeler (via HttpGet) pour
+// vérifier qu'une clé + un appareil sont valides, et récupérer le script
+// obfusqué. Utilise le même stockage (db.js) que le bot Discord, donc les
+// données sont toujours à jour, qu'elles viennent de MongoDB ou des
+// fichiers locaux.
 
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-
-const DATA_DIR = path.join(__dirname, 'data');
-const KEYS_PATH = path.join(DATA_DIR, 'keys.json');
-const PRODUCTS_PATH = path.join(DATA_DIR, 'products.json');
-const BLACKLIST_PATH = path.join(DATA_DIR, 'blacklist.json');
-const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
-
-function loadJson(p, fallback) {
-  try { return JSON.parse(fs.readFileSync(p, 'utf8') || JSON.stringify(fallback)); }
-  catch (e) { return fallback; }
-}
-function saveJson(p, data) { fs.writeFileSync(p, JSON.stringify(data, null, 2)); }
+const https = require('https');
+const db = require('./db');
 
 const app = express();
 app.use(express.json());
+app.disable('x-powered-by');
+app.set('trust proxy', 1); // Render est derrière un proxy : nécessaire pour avoir la vraie IP du joueur, pas celle de Render.
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/', (req, res) => res.type('text/plain').send('ok'));
 
-// Sert le script obfusqué : c'est CETTE url que le loader court livré à
-// l'acheteur va appeler via game:HttpGet(...). Le nom de fichier est un
-// hash aléatoire non-devinable généré à la création du produit.
-// La clé (?key=...) est vérifiée à CHAQUE appel : si l'acheteur est
-// blacklist, si la clé a expiré, ou si le killswitch est actif, le script
-// n'est plus servi — donc plus utilisable dans Roblox dès le prochain
-// lancement.
-app.get('/scripts/hosted/:filename', (req, res) => {
-  const products = loadJson(PRODUCTS_PATH, {});
+// Alerte optionnelle sur un webhook Discord (variable LOG_WEBHOOK_URL) quand
+// une clé est utilisée depuis un autre appareil. Une alerte max toutes les
+// 10 minutes par clé, pour ne pas spammer ton salon.
+const ALERT_COOLDOWN_MS = 10 * 60 * 1000;
+const lastAlert = new Map();
+function alertWebhook(text) {
+  const url = process.env.LOG_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const body = JSON.stringify({ content: text.slice(0, 1900) });
+    const req = https.request(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (r) => r.resume());
+    req.on('error', () => {});
+    req.end(body);
+  } catch (e) { /* on ignore : l'alerte est un bonus, jamais bloquante */ }
+}
+
+// Petit rate-limit maison (pas de dépendance en plus) : par IP, sur la
+// route de livraison uniquement. Ça n'empêche pas un vrai brute-force (la
+// clé fait 128 bits, c'est déjà hors de portée), mais ça bloque le
+// spam/scraping et les boucles de scripts mal codées qui rappellent en
+// continu.
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const RATE_LIMIT_MAX = 30; // 30 requêtes / IP / fenêtre
+const hits = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS;
+  for (const [ip, arr] of hits) {
+    const kept = arr.filter((t) => t > cutoff);
+    if (kept.length) hits.set(ip, kept); else hits.delete(ip);
+  }
+}, RATE_LIMIT_WINDOW_MS).unref();
+
+function rateLimit(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const now = Date.now();
+  const arr = (hits.get(ip) || []).filter((t) => t > now - RATE_LIMIT_WINDOW_MS);
+  arr.push(now);
+  hits.set(ip, arr);
+  if (arr.length > RATE_LIMIT_MAX) {
+    res.set('Retry-After', String(Math.ceil(RATE_LIMIT_WINDOW_MS / 1000)));
+    return res.type('text/plain').status(429).send('-- access denied: too many requests, try again later');
+  }
+  next();
+}
+
+// GET /scripts/hosted/:filename?key=XXXX&hwid=YYYY
+// Sert le script obfusqué UNIQUEMENT si la clé est valide, non expirée,
+// non killswitchée et son propriétaire n'est pas blacklist. Sinon, refuse
+// — donc blacklist quelqu'un = son loadstring ne fonctionne plus.
+//
+// Verrouillage HWID : au premier appel avec un hwid exploitable (différent
+// de "unknown"/vide), on le mémorise sur la clé. Aux appels suivants, si le
+// hwid reçu ne correspond pas à celui mémorisé, on refuse — donc une clé
+// partagée à quelqu'un d'autre ne fonctionne plus pour lui. `/resetkeyhwid`
+// (admin) ou le bouton "Reset HWID" (self-service, avec cooldown) effacent
+// ce verrou pour changer d'appareil.
+app.get('/scripts/hosted/:filename', rateLimit, async (req, res) => {
+  const products = db.get('products') || {};
   const [productId, product] = Object.entries(products).find(([, p]) => p.hostedFilename === req.params.filename) || [];
   if (!product) return res.type('text/plain').send('-- not found');
 
   const keyValue = String(req.query.key || '').trim().toUpperCase();
-  const keys = loadJson(KEYS_PATH, []);
+  const keys = db.get('keys') || [];
   const record = keys.find((k) => k.key === keyValue && k.productId === productId);
   if (!record) return res.type('text/plain').send('-- access denied: invalid key');
 
-  const blacklist = loadJson(BLACKLIST_PATH, {});
+  const blacklist = db.get('blacklist') || {};
   if (record.userId && blacklist[record.userId]) return res.type('text/plain').send('-- access denied: blacklisted');
 
-  const config = loadJson(CONFIG_PATH, {});
+  const config = db.get('config') || {};
   if (config.killswitchGlobal || product.killswitch) return res.type('text/plain').send('-- access denied: disabled');
 
   if (record.expiresAt && Date.now() > record.expiresAt) return res.type('text/plain').send('-- access denied: expired');
 
+  const incomingHwid = String(req.query.hwid || '').trim();
+  const hasUsableHwid = incomingHwid && incomingHwid.toLowerCase() !== 'unknown';
+  if (hasUsableHwid) {
+    if (!record.hwid) {
+      // Premier appel exploitable : on verrouille la clé à cet appareil.
+      record.hwid = incomingHwid;
+      await db.set('keys', keys);
+    } else if (record.hwid !== incomingHwid) {
+      const last = lastAlert.get(record.key) || 0;
+      if (Date.now() - last > ALERT_COOLDOWN_MS) {
+        lastAlert.set(record.key, Date.now());
+        alertWebhook(`⚠️ HWID différent pour la clé \`${record.key}\` (${product.name || productId})${record.userId ? ` — propriétaire <@${record.userId}>` : ''}. Clé peut-être partagée.`);
+      }
+      return res.type('text/plain').send('-- access denied: hwid mismatch (this key is locked to another device)');
+    }
+  }
+
+  // Livraison réussie : on compte le lancement (visible dans /lookupkey et /stats).
+  record.useCount = (record.useCount || 0) + 1;
+  record.lastUsedAt = Date.now();
+  try { await db.set('keys', keys); } catch (e) { console.error('Sauvegarde du lancement impossible :', e.message); }
+
+  res.set('Cache-Control', 'no-store');
   res.type('text/plain').send(product.script || '-- empty');
-});
-
-// POST /verify  body: { "key": "XXXX-XXXX-XXXX-XXXX", "hwid": "identifiant-machine" }
-app.post('/verify', (req, res) => {
-  const { key, hwid } = req.body || {};
-  if (!key || !hwid) return res.status(400).json({ valid: false, reason: 'missing_params' });
-
-  const keys = loadJson(KEYS_PATH, []);
-  const record = keys.find((k) => k.key === String(key).trim().toUpperCase());
-  if (!record) return res.json({ valid: false, reason: 'invalid_key' });
-  if (!record.userId) return res.json({ valid: false, reason: 'not_claimed' }); // pas encore réclamée sur Discord
-
-  const blacklist = loadJson(BLACKLIST_PATH, {});
-  if (blacklist[record.userId]) return res.json({ valid: false, reason: 'blacklisted' });
-
-  const config = loadJson(CONFIG_PATH, { killswitchGlobal: false });
-  const products = loadJson(PRODUCTS_PATH, {});
-  const product = products[record.productId];
-  if (config.killswitchGlobal || product?.killswitch) return res.json({ valid: false, reason: 'killswitch' });
-
-  if (record.expiresAt && Date.now() > record.expiresAt) return res.json({ valid: false, reason: 'expired' });
-
-  if (!record.hwid) {
-    // premier lancement : on lie la clé à cet appareil
-    record.hwid = hwid;
-    saveJson(KEYS_PATH, keys);
-    return res.json({ valid: true, firstBind: true });
-  }
-
-  if (record.hwid !== hwid) {
-    return res.json({ valid: false, reason: 'hwid_mismatch' });
-  }
-
-  return res.json({ valid: true });
 });
 
 const PORT = process.env.PORT || 3000;

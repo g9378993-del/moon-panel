@@ -27,6 +27,11 @@ const {
 // ----------------------------------------------------------------
 // CONFIG
 // ----------------------------------------------------------------
+// Évite que le bot s'arrête complètement sur une erreur imprévue (Render le
+// relancerait, mais on perd la connexion Discord pendant quelques secondes).
+process.on('unhandledRejection', (err) => console.error('Promesse rejetée non gérée :', err));
+process.on('uncaughtException', (err) => console.error('Exception non gérée :', err));
+
 const APP_CONFIG = { KEY_LENGTH: 16, EMBED_COLOR: 0x5865F2, BOT_NAME: 'Script Panel' };
 
 // ----------------------------------------------------------------
@@ -286,10 +291,29 @@ function buildHostedLoader(record, product) {
       `script_key = "${record.key}"`,
     ].join('\n');
   }
+  // Identifiant d'appareil : on essaie les fonctions exposées par les
+  // executors (gethwid, get_hwid, syn.crypto.hwid), puis l'ID client Roblox
+  // en dernier recours. (identifyexecutor() n'est PAS utilisé : il renvoie
+  // le nom de l'executor, identique pour tous les joueurs.) Si rien ne
+  // marche, on envoie "unknown" : le serveur autorise mais ne verrouille pas.
+  const hwidSnippet = [
+    'local function _mo_hwid()',
+    '  local ok, id = pcall(function()',
+    '    if gethwid then return gethwid() end',
+    '    if get_hwid then return get_hwid() end',
+    '    if syn and syn.crypto and syn.crypto.hwid then return syn.crypto.hwid() end',
+    '    return game:GetService("RbxAnalyticsService"):GetClientId()',
+    '  end)',
+    '  if ok and id and tostring(id) ~= "" then return tostring(id) end',
+    '  return "unknown"',
+    'end',
+  ].join('\n');
+  const url = `${base.replace(/\/$/, '')}/scripts/hosted/${product.hostedFilename}?key=${record.key}&hwid=`;
   return [
     `script_key = "${record.key}"`,
     '',
-    `loadstring(game:HttpGet("${base.replace(/\/$/, '')}/scripts/hosted/${product.hostedFilename}?key=${record.key}"))()`,
+    hwidSnippet,
+    `loadstring(game:HttpGet("${url}" .. game:GetService("HttpService"):UrlEncode(_mo_hwid())))()`,
   ].join('\n');
 }
 
@@ -797,7 +821,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             { name: 'Créée', value: fmtDate(record.createdAt), inline: true },
             { name: 'Réclamée', value: fmtDate(record.claimedAt), inline: true },
             { name: 'Expire', value: record.expiresAt ? fmtDate(record.expiresAt) : 'Jamais', inline: true },
-            { name: 'Utilisée', value: fmtDate(record.redeemedAt), inline: true }
+            { name: 'Utilisée', value: fmtDate(record.redeemedAt), inline: true },
+            { name: 'Lancements', value: `${record.useCount || 0}`, inline: true },
+            { name: 'Dernier lancement', value: fmtDate(record.lastUsedAt), inline: true }
           );
         await interaction.editReply({ embeds: [embed] });
         return;
@@ -884,12 +910,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const keys = loadKeys();
         const blacklist = loadBlacklist();
         const totalRedeemed = keys.filter((k) => k.redeemedAt).length;
+        const nowTs = Date.now();
+        const totalExpired = keys.filter((k) => k.expiresAt && k.expiresAt < nowTs).length;
+        const totalLocked = keys.filter((k) => k.hwid).length;
+        const totalLaunches = keys.reduce((n, k) => n + (k.useCount || 0), 0);
         const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle('📊 Statistiques')
           .addFields(
             { name: 'Produits', value: `${Object.keys(products).length}`, inline: true },
             { name: 'Clés générées', value: `${keys.length}`, inline: true },
             { name: 'Clés utilisées', value: `${totalRedeemed}`, inline: true },
-            { name: 'Blacklist', value: `${Object.keys(blacklist).length}`, inline: true }
+            { name: 'Blacklist', value: `${Object.keys(blacklist).length}`, inline: true },
+            { name: 'Clés expirées', value: `${totalExpired}`, inline: true },
+            { name: 'Clés verrouillées HWID', value: `${totalLocked}`, inline: true },
+            { name: 'Lancements du script', value: `${totalLaunches}`, inline: true }
           );
         for (const [id, p] of Object.entries(products)) {
           embed.addFields({ name: p.name, value: `${issuedCountForProduct(keys, id)} clé(s)`, inline: false });
@@ -1054,7 +1087,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         for (const k of owned) {
           embed.addFields({
             name: products[k.productId]?.name || k.productId,
-            value: `HWID: ${k.hwid ? '✅' : '—'} | Expire: ${k.expiresAt ? fmtDate(k.expiresAt) : 'Jamais'} | ${k.redeemedAt ? 'Utilisée' : 'Non utilisée'}`,
+            value: `HWID: ${k.hwid ? '✅' : '—'} | Expire: ${k.expiresAt ? fmtDate(k.expiresAt) : 'Jamais'} | ${k.redeemedAt ? 'Utilisée' : 'Non utilisée'} | Lancements: ${k.useCount || 0}`,
           });
         }
         await interaction.editReply({ embeds: [embed] });
@@ -1313,7 +1346,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 (async () => {
   await db.initDb();
 
-  client.login(process.env.DISCORD_TOKEN);
+  if (!process.env.DISCORD_TOKEN) console.error('❌ DISCORD_TOKEN manquant : ajoute-le dans les variables d\'environnement.');
+  client.login(process.env.DISCORD_TOKEN).catch((e) => console.error('❌ Connexion Discord impossible :', e.message));
 
   // Lance aussi le petit serveur web (vérification HWID + scripts hébergés)
   // dans le même programme, pour qu'ils partagent les mêmes données et que
