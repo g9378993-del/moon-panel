@@ -480,7 +480,16 @@ async function registerCommands() {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
+  console.log(`Serveurs actuels (${client.guilds.cache.size}) :`, [...client.guilds.cache.values()].map((g) => `${g.name} (${g.id})`).join(' | '));
   await registerCommands();
+});
+
+// Logs pour diagnostiquer si le bot rejoint/quitte bien un serveur.
+client.on(Events.GuildCreate, (guild) => {
+  console.log(`✅ Bot ajouté à un nouveau serveur : ${guild.name} (${guild.id})`);
+});
+client.on(Events.GuildDelete, (guild) => {
+  console.log(`❌ Bot retiré d'un serveur : ${guild.name || guild.id}`);
 });
 
 // ----------------------------------------------------------------
