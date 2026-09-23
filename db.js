@@ -60,12 +60,15 @@ async function initDb() {
 
 function get(name) { return cache[name]; }
 
-function set(name, value) {
+async function set(name, value) {
   cache[name] = value;
   saveLocalFile(name, value);
   if (mongoReady && collection) {
-    collection.updateOne({ _id: name }, { $set: { data: value } }, { upsert: true })
-      .catch((e) => console.error('Erreur écriture MongoDB :', e.message));
+    try {
+      await collection.updateOne({ _id: name }, { $set: { data: value } }, { upsert: true });
+    } catch (e) {
+      console.error('Erreur écriture MongoDB :', e.message);
+    }
   }
 }
 

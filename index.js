@@ -60,17 +60,17 @@ function loadJson(p, fallback) {
 function saveJson(p, data) { fs.writeFileSync(p, JSON.stringify(data, null, 2)); }
 
 function loadKeys() { return db.get('keys'); }
-function saveKeys(d) { db.set('keys', d); }
+async function saveKeys(d) { await db.set('keys', d); }
 function loadProducts() { return db.get('products'); }
-function saveProducts(d) { db.set('products', d); }
+async function saveProducts(d) { await db.set('products', d); }
 function loadRoleMap() { return db.get('roleMap'); }
-function saveRoleMap(d) { db.set('roleMap', d); }
+async function saveRoleMap(d) { await db.set('roleMap', d); }
 function loadBlacklist() { return db.get('blacklist'); }
-function saveBlacklist(d) { db.set('blacklist', d); }
+async function saveBlacklist(d) { await db.set('blacklist', d); }
 function loadConfig() { return { ...DEFAULT_CONFIG, ...db.get('config') }; }
-function saveConfig(d) { db.set('config', d); }
+async function saveConfig(d) { await db.set('config', d); }
 function loadPanels() { return db.get('panels'); }
-function savePanels(d) { db.set('panels', d); }
+async function savePanels(d) { await db.set('panels', d); }
 
 function slugify(name) {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'produit';
@@ -146,10 +146,10 @@ function buildPanelButtons() {
 // ----------------------------------------------------------------
 // SUIVI DES PANELS PUBLIÉS (pour les mettre à jour automatiquement)
 // ----------------------------------------------------------------
-function trackPanel(message) {
+async function trackPanel(message) {
   const panels = loadPanels();
   panels.push({ messageId: message.id, channelId: message.channelId, createdAt: Date.now() });
-  savePanels(panels);
+  await savePanels(panels);
 }
 
 async function updatePanelByRecord(record) {
@@ -164,7 +164,7 @@ async function updatePanelByRecord(record) {
     // ou salon supprimé). Pour toute autre erreur (permissions, réseau...),
     // on le garde en suivi et on remonte le vrai message d'erreur.
     const reallyGone = e.code === 10008 || e.code === 10003;
-    if (reallyGone) savePanels(loadPanels().filter((p) => p.messageId !== record.messageId));
+    if (reallyGone) await savePanels(loadPanels().filter((p) => p.messageId !== record.messageId));
     return { ok: false, reason: reallyGone ? 'gone' : (e.message || 'inconnue') };
   }
 }
@@ -202,7 +202,7 @@ async function offerPanelUpdate(interaction) {
 // ----------------------------------------------------------------
 // GÉNÉRATION DE CLÉS
 // ----------------------------------------------------------------
-function issueKeyForUser(userId, productId, { bypassStock = false } = {}) {
+async function issueKeyForUser(userId, productId, { bypassStock = false } = {}) {
   const products = loadProducts();
   const product = products[productId];
   if (!product) return { error: "Ce produit n'existe plus." };
@@ -219,11 +219,11 @@ function issueKeyForUser(userId, productId, { bypassStock = false } = {}) {
   const expiresAt = product.expireDays && product.expireDays > 0 ? now + product.expireDays * 86400000 : null;
   const record = { key: generateKeyString(), productId, userId, hwid: null, hwidResetAt: null, createdAt: now, claimedAt: now, expiresAt, redeemedAt: null };
   keys.push(record);
-  saveKeys(keys);
+  await saveKeys(keys);
   return { key: record.key, alreadyExisted: false };
 }
 
-function bulkGenerate(productId, quantity, { bypassStock = false } = {}) {
+async function bulkGenerate(productId, quantity, { bypassStock = false } = {}) {
   const products = loadProducts();
   const product = products[productId];
   if (!product) return { error: "Ce produit n'existe plus." };
@@ -241,7 +241,7 @@ function bulkGenerate(productId, quantity, { bypassStock = false } = {}) {
     keys.push(record);
     generated.push(record.key);
   }
-  saveKeys(keys);
+  await saveKeys(keys);
   return { keys: generated };
 }
 
@@ -255,7 +255,7 @@ async function createProductFromScriptInput({ id, name, stock, expireDays, scrip
   const hostedFilename = `${crypto.randomBytes(24).toString('hex')}.lua`;
   const products = loadProducts();
   products[id] = { name, script: obfuscated, rawScript: rawContent, hostedFilename, stock, expireDays, killswitch: false };
-  saveProducts(products);
+  await saveProducts(products);
 }
 
 async function dmUser(user, content) {
@@ -445,22 +445,33 @@ const commands = [
     .addStringOption((o) => o.setName('emoji').setDescription('Le nouvel emoji, ex: 🔥').setRequired(true)),
 ].map((c) => c.toJSON());
 
-// Commande globale (tous serveurs où le bot est présent), réservée à
-// OWNER_ID. Enregistrée séparément des autres pour être disponible partout.
+// Commandes globales (tous serveurs où le bot est présent), réservées à
+// OWNER_ID. Enregistrées séparément des autres pour être disponibles partout.
 const ownerCommands = [
   new SlashCommandBuilder().setName('ownerinfo').setDescription('Statistiques du bot (toi uniquement, dans tous les serveurs)'),
+  new SlashCommandBuilder()
+    .setName('disableguild')
+    .setDescription('(Toi uniquement) Désactive le bot sur un serveur précis')
+    .addStringOption((o) => o.setName('guild_id').setDescription("L'ID du serveur (vu via /ownerinfo)").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('enableguild')
+    .setDescription('(Toi uniquement) Réactive le bot sur un serveur précis')
+    .addStringOption((o) => o.setName('guild_id').setDescription("L'ID du serveur").setRequired(true)),
 ].map((c) => c.toJSON());
 
+// Toutes les commandes sont désormais enregistrées en GLOBAL (pas limitées
+// à un seul serveur) pour que le bot fonctionne partout où on l'ajoute.
+// Ça peut prendre jusqu'à 1h pour apparaître partout (contre instantané
+// avant, quand c'était limité à un seul serveur).
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: [...commands, ...ownerCommands] });
+    console.log('Commandes slash enregistrées en global (tous serveurs).');
     if (process.env.GUILD_ID) {
-      await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
-      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: ownerCommands });
-      console.log('Commandes slash enregistrées (guild + /ownerinfo en global).');
-    } else {
-      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: [...commands, ...ownerCommands] });
-      console.log('Commandes slash enregistrées (global).');
+      // Nettoie les anciennes commandes propres au serveur (avant le passage
+      // au global) pour éviter que chaque commande apparaisse deux fois.
+      await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: [] });
     }
   } catch (err) {
     console.error('Erreur enregistrement des commandes :', err);
@@ -485,7 +496,7 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   for (const [, role] of newRoles) {
     const productId = roleMap[role.id];
     if (!productId) continue;
-    const result = issueKeyForUser(newMember.id, productId);
+    const result = await issueKeyForUser(newMember.id, productId);
     if (result.error || result.alreadyExisted) continue;
     const products = loadProducts();
     await dmUser(newMember.user, {
@@ -504,6 +515,18 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
 // ----------------------------------------------------------------
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    // Serveur désactivé par le propriétaire : on bloque tout, sauf pour
+    // OWNER_ID lui-même (qui doit toujours pouvoir gérer/réactiver).
+    if (interaction.guildId && interaction.user.id !== process.env.OWNER_ID) {
+      const disabledGuilds = loadConfig().disabledGuildIds || [];
+      if (disabledGuilds.includes(interaction.guildId)) {
+        if (interaction.isRepliable()) {
+          await interaction.reply({ content: '❌ Ce bot est désactivé sur ce serveur.', ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
+    }
+
     // --- Autocomplete produit ---
     if (interaction.isAutocomplete()) {
       const focused = interaction.options.getFocused().toLowerCase();
@@ -526,7 +549,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (cmd === 'panel') {
         await interaction.deferReply();
         const sentMessage = await interaction.editReply({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
-        trackPanel(sentMessage);
+        await trackPanel(sentMessage);
 
         if (isAdmin) {
           const config = loadConfig();
@@ -588,6 +611,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               '**Sécurité** : `/resetkeyhwid` `/sethwidcooldown` `/killswitch` `/blacklist` `/unblacklist`',
               '**Apparence** : `/setcolor` `/settitle` `/setdescription` `/setfooter` `/setemoji` (boutons et produit se configurent via `/panel`)',
               '**Autre** : `/language` `/stats`',
+              '**Multi-serveurs (toi uniquement, partout)** : `/ownerinfo` `/disableguild` `/enableguild`',
             ].join('\n'),
           });
         }
@@ -602,11 +626,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
         const guilds = [...client.guilds.cache.values()];
+        const disabledGuilds = loadConfig().disabledGuildIds || [];
         const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(`📡 Ton bot est utilisé dans ${guilds.length} serveur(s)`);
         for (const g of guilds.slice(0, 25)) {
-          embed.addFields({ name: g.name, value: `ID: ${g.id} | Membres: ${g.memberCount}`, inline: false });
+          const status = disabledGuilds.includes(g.id) ? ' 🔴 désactivé' : '';
+          embed.addFields({ name: `${g.name}${status}`, value: `ID: ${g.id} | Membres: ${g.memberCount}`, inline: false });
         }
         await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (cmd === 'disableguild' || cmd === 'enableguild') {
+        await interaction.deferReply({ ephemeral: true });
+        if (interaction.user.id !== process.env.OWNER_ID) {
+          await interaction.editReply({ content: '❌ Cette commande est réservée au propriétaire du bot.' });
+          return;
+        }
+        const guildId = interaction.options.getString('guild_id').trim();
+        const targetGuild = client.guilds.cache.get(guildId);
+        if (!targetGuild) { await interaction.editReply({ content: "❌ Le bot n'est pas dans un serveur avec cet ID." }); return; }
+
+        const config = loadConfig();
+        const disabledGuilds = new Set(config.disabledGuildIds || []);
+        if (cmd === 'disableguild') disabledGuilds.add(guildId);
+        else disabledGuilds.delete(guildId);
+        config.disabledGuildIds = [...disabledGuilds];
+        await saveConfig(config);
+
+        await interaction.editReply({
+          content: cmd === 'disableguild'
+            ? `🔴 Bot désactivé sur **${targetGuild.name}**.`
+            : `🟢 Bot réactivé sur **${targetGuild.name}**.`,
+        });
         return;
       }
 
@@ -633,10 +684,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const products = loadProducts();
         if (!products[id]) { await interaction.editReply({ content: '❌ Produit introuvable.' }); return; }
         delete products[id];
-        saveProducts(products);
+        await saveProducts(products);
         const roleMap = loadRoleMap();
         for (const roleId of Object.keys(roleMap)) if (roleMap[roleId] === id) delete roleMap[roleId];
-        saveRoleMap(roleMap);
+        await saveRoleMap(roleMap);
         await interaction.editReply({ content: '✅ Produit supprimé.' });
         await offerPanelUpdate(interaction);
         return;
@@ -649,7 +700,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!products[productId]) { await interaction.editReply({ content: '❌ Produit introuvable.' }); return; }
         const roleMap = loadRoleMap();
         roleMap[role.id] = productId;
-        saveRoleMap(roleMap);
+        await saveRoleMap(roleMap);
         await interaction.editReply({ content: `✅ <@&${role.id}> déclenche maintenant une clé pour **${products[productId].name}**.` });
         return;
       }
@@ -659,7 +710,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const productId = interaction.options.getString('produit');
         const blacklist = loadBlacklist();
         if (blacklist[target.id]) { await interaction.editReply({ content: '❌ Cet utilisateur est blacklist.' }); return; }
-        const result = issueKeyForUser(target.id, productId, { bypassStock: true });
+        const result = await issueKeyForUser(target.id, productId, { bypassStock: true });
         if (result.error) { await interaction.editReply({ content: `❌ ${result.error}` }); return; }
         await interaction.editReply({ content: `✅ Clé pour <@${target.id}> : \`${result.key}\`` });
         return;
@@ -686,7 +737,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
           return;
         }
-        const result = issueKeyForUser(target.id, productId, { bypassStock: true });
+        const result = await issueKeyForUser(target.id, productId, { bypassStock: true });
         if (result.error) { await interaction.editReply({ content: `❌ ${result.error}` }); return; }
         await interaction.editReply({ content: `✅ Clé pour <@${target.id}> : \`${result.key}\` (aucun rôle lié, clé attribuée directement).` });
         return;
@@ -696,7 +747,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const productId = interaction.options.getString('produit');
         const quantity = interaction.options.getInteger('quantite');
         if (quantity < 1 || quantity > 100) { await interaction.editReply({ content: '❌ Quantité entre 1 et 100.' }); return; }
-        const result = bulkGenerate(productId, quantity, { bypassStock: true });
+        const result = await bulkGenerate(productId, quantity, { bypassStock: true });
         if (result.error) { await interaction.editReply({ content: `❌ ${result.error}` }); return; }
         await interaction.editReply({ content: `✅ ${quantity} clé(s) générée(s) :\n\`\`\`${result.keys.join('\n')}\`\`\`` });
         return;
@@ -708,7 +759,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const idx = keys.findIndex((k) => k.key === value);
         if (idx === -1) { await interaction.editReply({ content: '❌ Clé introuvable.' }); return; }
         keys.splice(idx, 1);
-        saveKeys(keys);
+        await saveKeys(keys);
         await interaction.editReply({ content: '✅ Clé supprimée.' });
         return;
       }
@@ -718,7 +769,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const keys = loadKeys();
         const remaining = keys.filter((k) => k.userId !== target.id);
         const removedCount = keys.length - remaining.length;
-        saveKeys(remaining);
+        await saveKeys(remaining);
         await interaction.editReply({ content: `✅ ${removedCount} clé(s) supprimée(s) pour <@${target.id}>.` });
         return;
       }
@@ -766,7 +817,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!record) { await interaction.editReply({ content: '❌ Clé introuvable.' }); return; }
         record.hwid = null;
         record.hwidResetAt = Date.now();
-        saveKeys(keys);
+        await saveKeys(keys);
         await interaction.editReply({ content: `✅ HWID réinitialisé pour \`${record.key}\`.` });
         return;
       }
@@ -775,7 +826,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const hours = interaction.options.getInteger('heures');
         const config = loadConfig();
         config.hwidCooldownHours = hours;
-        saveConfig(config);
+        await saveConfig(config);
         await interaction.editReply({ content: `✅ Délai de reset HWID : ${hours}h.` });
         return;
       }
@@ -786,7 +837,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (productId === 'tous') {
           const config = loadConfig();
           config.killswitchGlobal = state;
-          saveConfig(config);
+          await saveConfig(config);
           await interaction.editReply({ content: `✅ Killswitch global : ${state ? 'activé (tout bloqué)' : 'désactivé'}.` });
           await offerPanelUpdate(interaction);
           return;
@@ -794,7 +845,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const products = loadProducts();
         if (!products[productId]) { await interaction.editReply({ content: '❌ Produit introuvable.' }); return; }
         products[productId].killswitch = state;
-        saveProducts(products);
+        await saveProducts(products);
         await interaction.editReply({ content: `✅ ${products[productId].name} : ${state ? 'accès bloqué' : 'accès rétabli'}.` });
         await offerPanelUpdate(interaction);
         return;
@@ -805,7 +856,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const reason = interaction.options.getString('raison') || 'Non spécifiée';
         const blacklist = loadBlacklist();
         blacklist[target.id] = { reason, bannedAt: Date.now() };
-        saveBlacklist(blacklist);
+        await saveBlacklist(blacklist);
         await interaction.editReply({ content: `✅ <@${target.id}> blacklist. Raison : ${reason}` });
         return;
       }
@@ -814,7 +865,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const target = interaction.options.getUser('utilisateur');
         const blacklist = loadBlacklist();
         delete blacklist[target.id];
-        saveBlacklist(blacklist);
+        await saveBlacklist(blacklist);
         await interaction.editReply({ content: `✅ <@${target.id}> retiré de la liste noire.` });
         return;
       }
@@ -843,7 +894,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!/^[0-9A-Fa-f]{6}$/.test(raw)) { await interaction.editReply({ content: '❌ Format invalide. Exemple : #ff0000' }); return; }
         const config = loadConfig();
         config.panelColor = parseInt(raw, 16);
-        saveConfig(config);
+        await saveConfig(config);
         await interaction.editReply({ content: `✅ Couleur du panel changée en #${raw}.` });
         await offerPanelUpdate(interaction);
         return;
@@ -852,7 +903,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (cmd === 'settitle') {
         const config = loadConfig();
         config.panelTitle = interaction.options.getString('titre');
-        saveConfig(config);
+        await saveConfig(config);
         await interaction.editReply({ content: '✅ Titre du panel mis à jour.' });
         await offerPanelUpdate(interaction);
         return;
@@ -861,7 +912,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (cmd === 'setdescription') {
         const config = loadConfig();
         config.panelDescription = interaction.options.getString('texte');
-        saveConfig(config);
+        await saveConfig(config);
         await interaction.editReply({ content: '✅ Description du panel mise à jour.' });
         await offerPanelUpdate(interaction);
         return;
@@ -870,7 +921,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (cmd === 'setfooter') {
         const config = loadConfig();
         config.panelFooter = interaction.options.getString('texte');
-        saveConfig(config);
+        await saveConfig(config);
         await interaction.editReply({ content: '✅ Pied de page du panel mis à jour.' });
         await offerPanelUpdate(interaction);
         return;
@@ -880,7 +931,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const langChoice = interaction.options.getString('langue');
         const config = loadConfig();
         config.language = langChoice;
-        saveConfig(config);
+        await saveConfig(config);
         const note = ['es', 'pt', 'de'].includes(langChoice) ? ' (traduction pas encore faite, affichera l\'anglais)' : '';
         await interaction.editReply({ content: `✅ Langue des acheteurs : ${langChoice}${note}.` });
         await offerPanelUpdate(interaction);
@@ -892,7 +943,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const emoji = interaction.options.getString('emoji');
         const config = loadConfig();
         config.buttonEmojis = { ...config.buttonEmojis, [btn]: emoji };
-        saveConfig(config);
+        await saveConfig(config);
         await interaction.editReply({ content: `✅ Emoji mis à jour pour ce bouton : ${emoji}` });
         await offerPanelUpdate(interaction);
         return;
@@ -950,7 +1001,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const lines = [];
         for (const [roleId, productId] of Object.entries(roleMap)) {
           if (!member.roles.cache.has(roleId)) continue;
-          const result = issueKeyForUser(member.id, productId);
+          const result = await issueKeyForUser(member.id, productId);
           if (result.error) { lines.push(`❌ ${products[productId]?.name || productId} : ${result.error}`); continue; }
           lines.push(`🔑 ${products[productId]?.name || productId} : \`${result.key}\``);
         }
@@ -1100,7 +1151,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferUpdate();
         const newConfig = loadConfig();
         newConfig.panelButtons = interaction.values;
-        saveConfig(newConfig);
+        await saveConfig(newConfig);
         await interaction.editReply({
           content: `✅ Boutons optionnels : ${interaction.values.length ? interaction.values.join(', ') : 'aucun'}.`,
           components: interaction.message.components,
@@ -1200,7 +1251,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         record.hwid = null;
         record.hwidResetAt = Date.now();
-        saveKeys(keys);
+        await saveKeys(keys);
         await interaction.editReply({ content: t(lang, 'msg_hwid_reset_success') });
         return;
       }
@@ -1230,7 +1281,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!product || !product.script) { await interaction.editReply({ content: t(lang, 'msg_no_script_configured') }); return; }
 
         record.redeemedAt = record.redeemedAt || Date.now();
-        saveKeys(keys);
+        await saveKeys(keys);
 
         const deliveryRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`deliver_dm_${record.key}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
