@@ -1,7 +1,7 @@
 {
   "name": "script-panel-bot",
-  "version": "1.0.0",
-  "description": "Bot Discord panel de distribution de script (clé auto par rôle + redeem)",
+  "version": "2.0.0",
+  "description": "Bot Discord panel de distribution de script (multi-serveurs)",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -11,6 +11,10 @@
   "dependencies": {
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "mongodb": "^6.10.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

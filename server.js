@@ -39,7 +39,7 @@ function alertWebhook(text) {
 // spam/scraping et les boucles de scripts mal codées qui rappellent en
 // continu.
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-const RATE_LIMIT_MAX = 30; // 30 requêtes / IP / fenêtre
+const RATE_LIMIT_MAX = 60; // 60 requêtes / IP / fenêtre (un lancement = 2 requêtes)
 const hits = new Map();
 setInterval(() => {
   const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS;
@@ -62,32 +62,81 @@ function rateLimit(req, res, next) {
   next();
 }
 
+// Chaque serveur Discord a ses propres produits et clés (voir db.js). Ici on
+// cherche donc dans tous les serveurs : le nom de fichier hébergé et la clé
+// sont uniques (aléatoires), il n'y a pas d'ambiguïté possible.
+function findByFilename(filename) {
+  for (const [gid, g] of Object.entries(db.all())) {
+    for (const [productId, product] of Object.entries(g.products || {})) {
+      if (product.hostedFilename === filename) return { gid, g, productId, product };
+    }
+  }
+  return null;
+}
+function findByKey(keyValue) {
+  for (const [gid, g] of Object.entries(db.all())) {
+    const record = (g.keys || []).find((k) => k.key === keyValue);
+    if (record) {
+      const product = (g.products || {})[record.productId];
+      if (product) return { gid, g, record, productId: record.productId, product };
+    }
+  }
+  return null;
+}
+
+// Petit "démarreur" Lua : calcule le HWID côté joueur puis charge le vrai
+// script. C'est ce qui permet au loader donné aux acheteurs de rester court
+// (2 lignes) au lieu de contenir tout ce code.
+function buildBootstrap(url) {
+  return [
+    'local function h()',
+    '  local ok, id = pcall(function()',
+    '    if gethwid then return gethwid() end',
+    '    if get_hwid then return get_hwid() end',
+    '    if syn and syn.crypto and syn.crypto.hwid then return syn.crypto.hwid() end',
+    '    return game:GetService("RbxAnalyticsService"):GetClientId()',
+    '  end)',
+    '  if ok and id and tostring(id) ~= "" then return tostring(id) end',
+    '  return "unknown"',
+    'end',
+    `loadstring(game:HttpGet("${url}" .. game:GetService("HttpService"):UrlEncode(h())))()`,
+    '',
+  ].join('\n');
+}
+
+// GET /l/:key  → loader court : renvoie le démarreur Lua ci-dessus.
+app.get('/l/:key', rateLimit, (req, res) => {
+  const keyValue = String(req.params.key || '').trim().toUpperCase();
+  const found = findByKey(keyValue);
+  res.set('Cache-Control', 'no-store');
+  if (!found) return res.type('text/plain').send('-- access denied: invalid key');
+  const base = (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+  const url = `${base}/scripts/hosted/${found.product.hostedFilename}?key=${found.record.key}&hwid=`;
+  res.type('text/plain').send(buildBootstrap(url));
+});
+
 // GET /scripts/hosted/:filename?key=XXXX&hwid=YYYY
 // Sert le script obfusqué UNIQUEMENT si la clé est valide, non expirée,
-// non killswitchée et son propriétaire n'est pas blacklist. Sinon, refuse
-// — donc blacklist quelqu'un = son loadstring ne fonctionne plus.
+// non killswitchée et son propriétaire n'est pas blacklist (dans le serveur
+// où la clé a été émise). Sinon, refuse.
 //
 // Verrouillage HWID : au premier appel avec un hwid exploitable (différent
 // de "unknown"/vide), on le mémorise sur la clé. Aux appels suivants, si le
-// hwid reçu ne correspond pas à celui mémorisé, on refuse — donc une clé
-// partagée à quelqu'un d'autre ne fonctionne plus pour lui. `/resetkeyhwid`
+// hwid reçu ne correspond pas à celui mémorisé, on refuse. `/resetkeyhwid`
 // (admin) ou le bouton "Reset HWID" (self-service, avec cooldown) effacent
 // ce verrou pour changer d'appareil.
 app.get('/scripts/hosted/:filename', rateLimit, async (req, res) => {
-  const products = db.get('products') || {};
-  const [productId, product] = Object.entries(products).find(([, p]) => p.hostedFilename === req.params.filename) || [];
-  if (!product) return res.type('text/plain').send('-- not found');
+  const hit = findByFilename(req.params.filename);
+  if (!hit) return res.type('text/plain').send('-- not found');
+  const { gid, g, productId, product } = hit;
 
   const keyValue = String(req.query.key || '').trim().toUpperCase();
-  const keys = db.get('keys') || [];
-  const record = keys.find((k) => k.key === keyValue && k.productId === productId);
+  const record = (g.keys || []).find((k) => k.key === keyValue && k.productId === productId);
   if (!record) return res.type('text/plain').send('-- access denied: invalid key');
 
-  const blacklist = db.get('blacklist') || {};
-  if (record.userId && blacklist[record.userId]) return res.type('text/plain').send('-- access denied: blacklisted');
+  if (record.userId && (g.blacklist || {})[record.userId]) return res.type('text/plain').send('-- access denied: blacklisted');
 
-  const config = db.get('config') || {};
-  if (config.killswitchGlobal || product.killswitch) return res.type('text/plain').send('-- access denied: disabled');
+  if ((g.config || {}).killswitchGlobal || product.killswitch) return res.type('text/plain').send('-- access denied: disabled');
 
   if (record.expiresAt && Date.now() > record.expiresAt) return res.type('text/plain').send('-- access denied: expired');
 
@@ -97,7 +146,7 @@ app.get('/scripts/hosted/:filename', rateLimit, async (req, res) => {
     if (!record.hwid) {
       // Premier appel exploitable : on verrouille la clé à cet appareil.
       record.hwid = incomingHwid;
-      await db.set('keys', keys);
+      await db.save(gid);
     } else if (record.hwid !== incomingHwid) {
       const last = lastAlert.get(record.key) || 0;
       if (Date.now() - last > ALERT_COOLDOWN_MS) {
@@ -111,11 +160,15 @@ app.get('/scripts/hosted/:filename', rateLimit, async (req, res) => {
   // Livraison réussie : on compte le lancement (visible dans /lookupkey et /stats).
   record.useCount = (record.useCount || 0) + 1;
   record.lastUsedAt = Date.now();
-  try { await db.set('keys', keys); } catch (e) { console.error('Sauvegarde du lancement impossible :', e.message); }
+  try { await db.save(gid); } catch (e) { console.error('Sauvegarde du lancement impossible :', e.message); }
 
   res.set('Cache-Control', 'no-store');
   res.type('text/plain').send(product.script || '-- empty');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Serveur de vérification HWID lancé sur le port ${PORT}`));
+function start() {
+  app.listen(PORT, () => console.log(`Serveur de vérification HWID lancé sur le port ${PORT}`));
+}
+// Lancé par index.js (db déjà initialisée) ou seul via "npm run verify-server".
+if (require.main === module) db.initDb().then(start); else start();

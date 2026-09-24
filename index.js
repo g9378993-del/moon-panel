@@ -1,6 +1,4 @@
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
 const db = require('./db');
@@ -34,48 +32,28 @@ process.on('uncaughtException', (err) => console.error('Exception non gérée :'
 
 const APP_CONFIG = { KEY_LENGTH: 16, EMBED_COLOR: 0x5865F2, BOT_NAME: 'Script Panel' };
 
-// ----------------------------------------------------------------
-// STOCKAGE
-// ----------------------------------------------------------------
-const DATA_DIR = path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const KEYS_PATH = path.join(DATA_DIR, 'keys.json');
-const PRODUCTS_PATH = path.join(DATA_DIR, 'products.json');
-const ROLEMAP_PATH = path.join(DATA_DIR, 'roleMap.json');
-const BLACKLIST_PATH = path.join(DATA_DIR, 'blacklist.json');
-const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
-const PANELS_PATH = path.join(DATA_DIR, 'panels.json');
-
-const DEFAULT_CONFIG = {
-  killswitchGlobal: false,
-  hwidCooldownHours: 0,
-  panelColor: 0x5865F2,
-  panelTitle: null,
-  panelDescription: null,
-  panelFooter: 'Made by aln',
-  language: 'en',
-  panelButtons: ['key_get', 'reset_hwid'], // le bouton clé/script est toujours présent en plus
-  buttonEmojis: { key_get: '🔑', key_redeem: '📥', view_script: '📜', key_info: '📊', get_buyer_role: '👤', reset_hwid: '🔄' },
+// Boutons que l'owner peut mettre (ou non) sur un panel.
+const PANEL_BUTTON_IDS = ['key_get', 'key_redeem', 'view_script', 'key_info', 'get_buyer_role', 'reset_hwid'];
+const BUTTON_DEFS = {
+  key_get: { label: 'btn_get_keys', style: ButtonStyle.Primary, emoji: '🔑' },
+  key_redeem: { label: 'btn_get_script', style: ButtonStyle.Success, emoji: '📥' },
+  view_script: { label: 'btn_view_script', style: ButtonStyle.Primary, emoji: '📜' },
+  key_info: { label: 'btn_key_info', style: ButtonStyle.Secondary, emoji: '📊' },
+  get_buyer_role: { label: 'btn_get_buyer_role', style: ButtonStyle.Secondary, emoji: '👤' },
+  reset_hwid: { label: 'btn_reset_hwid', style: ButtonStyle.Danger, emoji: '🔄' },
 };
 
-function loadJson(p, fallback) {
-  try { return JSON.parse(fs.readFileSync(p, 'utf8') || JSON.stringify(fallback)); }
-  catch (e) { return fallback; }
-}
-function saveJson(p, data) { fs.writeFileSync(p, JSON.stringify(data, null, 2)); }
+// Commandes réservées à TOI (OWNER_ID), utilisables partout.
+const OWNER_CMDS = new Set(['ownerinfo', 'disableguild', 'enableguild']);
+// Commandes dont la réponse contient des clés / données perso : toujours privées.
+const SENSITIVE_CMDS = new Set(['genkey', 'whitelist', 'bulkgen', 'lookupkey', 'lookupuser', 'permissions']);
 
-function loadKeys() { return db.get('keys'); }
-async function saveKeys(d) { await db.set('keys', d); }
-function loadProducts() { return db.get('products'); }
-async function saveProducts(d) { await db.set('products', d); }
-function loadRoleMap() { return db.get('roleMap'); }
-async function saveRoleMap(d) { await db.set('roleMap', d); }
-function loadBlacklist() { return db.get('blacklist'); }
-async function saveBlacklist(d) { await db.set('blacklist', d); }
-function loadConfig() { return { ...DEFAULT_CONFIG, ...db.get('config') }; }
-async function saveConfig(d) { await db.set('config', d); }
-function loadPanels() { return db.get('panels'); }
-async function savePanels(d) { await db.set('panels', d); }
+// ----------------------------------------------------------------
+// OUTILS
+// ----------------------------------------------------------------
+const isBotOwner = (userId) => !!process.env.OWNER_ID && userId === process.env.OWNER_ID;
+// Traduction inline des messages admin : L('français', 'english').
+const mk = (lang) => (fr, en) => (lang === 'fr' ? fr : en);
 
 function slugify(name) {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'produit';
@@ -83,10 +61,27 @@ function slugify(name) {
 function generateKeyString() {
   return crypto.randomBytes(APP_CONFIG.KEY_LENGTH).toString('hex').toUpperCase().match(/.{1,4}/g).join('-');
 }
-function findKeyByValue(keys, value) { return keys.find((k) => k.key === value); }
-function findKeysByUser(keys, userId) { return keys.filter((k) => k.userId === userId); }
-function issuedCountForProduct(keys, productId) { return keys.filter((k) => k.productId === productId).length; }
-function fmtDate(ts) { return ts ? new Date(ts).toLocaleString('fr-FR') : '—'; }
+const findKeyByValue = (g, value) => g.keys.find((k) => k.key === value);
+const findKeysByUser = (g, userId) => g.keys.filter((k) => k.userId === userId);
+const issuedCountForProduct = (g, productId) => g.keys.filter((k) => k.productId === productId).length;
+function fmtDate(ts, lang = 'fr') { return ts ? new Date(ts).toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-GB') : '—'; }
+
+// Qui a le droit d'utiliser les commandes du bot sur ce serveur ?
+// → le propriétaire du serveur, toi (OWNER_ID), et ceux que le propriétaire
+//   a autorisés avec /permissions (personnes ou rôles).
+function isGuildOwner(interaction, guild) { return !!guild && guild.ownerId === interaction.user.id; }
+function canManage(interaction, guild, g) {
+  const uid = interaction.user.id;
+  if (isBotOwner(uid) || isGuildOwner(interaction, guild)) return true;
+  if (g.allowedUsers.includes(uid)) return true;
+  const roles = interaction.member?.roles;
+  const roleIds = roles?.cache ? [...roles.cache.keys()] : (Array.isArray(roles) ? roles : []);
+  return g.allowedRoles.some((r) => roleIds.includes(r));
+}
+
+const NOT_CONFIGURED_MSG =
+  "⚠️ Le bot n'est pas encore configuré sur ce serveur : le propriétaire doit lancer `/start`.\n" +
+  "⚠️ The bot isn't set up on this server yet: the server owner must run `/start`.";
 
 // ----------------------------------------------------------------
 // CLIENT DISCORD
@@ -96,72 +91,107 @@ const client = new Client({
   partials: [Partials.Channel, Partials.GuildMember],
 });
 
-const pendingProducts = new Map();
+const pendingProducts = new Map(); // `${guildId}:${userId}` → produit en cours de création
+const panelDrafts = new Map(); // `${guildId}:${userId}` → brouillon de panel (boutons + produits choisis)
+const DRAFT_TTL_MS = 30 * 60 * 1000;
 
-// ----------------------------------------------------------------
-// EMBEDS / COMPOSANTS
-// ----------------------------------------------------------------
-function buildPanelEmbed() {
-  const products = loadProducts();
-  const config = loadConfig();
-  const list = Object.values(products).map((p) => `• **${p.name}**${p.killswitch ? ' 🔒 (désactivé)' : ''}`).join('\n') || 'Aucun produit configuré.';
-  return new EmbedBuilder()
-    .setColor(config.panelColor ?? APP_CONFIG.EMBED_COLOR)
-    .setTitle(config.panelTitle || `🔐 ${APP_CONFIG.BOT_NAME}`)
-    .setDescription(config.panelDescription || 'Utilise les boutons pour récupérer tes clés ou en utiliser une.')
-    .addFields({ name: 'Produits disponibles', value: list })
-    .setFooter({ text: config.panelFooter || 'Made by aln' });
+function getDraft(gid, uid) {
+  const d = panelDrafts.get(`${gid}:${uid}`);
+  if (!d) return null;
+  if (Date.now() - d.createdAt > DRAFT_TTL_MS) { panelDrafts.delete(`${gid}:${uid}`); return null; }
+  return d;
 }
 
-function buildPanelButtons() {
-  const config = loadConfig();
-  const lang = config.language;
-  const emo = (id, fallback) => config.buttonEmojis?.[id] || fallback;
-  const row1 = new ActionRowBuilder();
-  const row2 = new ActionRowBuilder();
+// ----------------------------------------------------------------
+// EMBEDS / COMPOSANTS DU PANEL
+// (chaque panel a SES boutons et SES produits, choisis via /panel)
+// ----------------------------------------------------------------
+function buildPanelEmbed(g, panel) {
+  const lang = g.config.language;
+  const list = panel.productIds
+    .map((id) => g.products[id])
+    .filter(Boolean)
+    .map((p) => `• **${p.name}**${p.killswitch ? ` 🔒 (${t(lang, 'tag_disabled')})` : ''}`)
+    .join('\n') || t(lang, 'panel_no_products');
+  return new EmbedBuilder()
+    .setColor(g.config.panelColor ?? APP_CONFIG.EMBED_COLOR)
+    .setTitle(g.config.panelTitle || `🔐 ${APP_CONFIG.BOT_NAME}`)
+    .setDescription(g.config.panelDescription || t(lang, 'panel_default_desc'))
+    .addFields({ name: t(lang, 'panel_products_field'), value: list.slice(0, 1024) })
+    .setFooter({ text: g.config.panelFooter || 'Made by aln' });
+}
 
-  if (config.panelButtons.includes('key_get')) {
-    row1.addComponents(new ButtonBuilder().setCustomId('key_get').setLabel(t(lang, 'btn_get_keys')).setEmoji(emo('key_get', '🔑')).setStyle(ButtonStyle.Primary));
+function buildPanelButtons(g, panel) {
+  const lang = g.config.language;
+  const ids = PANEL_BUTTON_IDS.filter((id) => panel.buttons.includes(id));
+  const rows = [];
+  for (let i = 0; i < ids.length; i += 3) {
+    const row = new ActionRowBuilder();
+    for (const id of ids.slice(i, i + 3)) {
+      const def = BUTTON_DEFS[id];
+      row.addComponents(new ButtonBuilder().setCustomId(id).setLabel(t(lang, def.label)).setEmoji(g.config.buttonEmojis?.[id] || def.emoji).setStyle(def.style));
+    }
+    rows.push(row);
   }
-
-  const redeemLabel = t(lang, 'btn_get_script');
-  row1.addComponents(new ButtonBuilder().setCustomId('key_redeem').setLabel(redeemLabel).setEmoji(emo('key_redeem', '📥')).setStyle(ButtonStyle.Success));
-
-  if (config.panelButtons.includes('view_script')) {
-    row1.addComponents(new ButtonBuilder().setCustomId('view_script').setLabel(t(lang, 'btn_view_script')).setEmoji(emo('view_script', '📜')).setStyle(ButtonStyle.Primary));
-  }
-
-  if (config.panelButtons.includes('key_info')) {
-    row2.addComponents(new ButtonBuilder().setCustomId('key_info').setLabel(t(lang, 'btn_key_info')).setEmoji(emo('key_info', '📊')).setStyle(ButtonStyle.Secondary));
-  }
-
-  if (config.panelButtons.includes('get_buyer_role')) {
-    row2.addComponents(new ButtonBuilder().setCustomId('get_buyer_role').setLabel(t(lang, 'btn_get_buyer_role')).setEmoji(emo('get_buyer_role', '👤')).setStyle(ButtonStyle.Secondary));
-  }
-
-  if (config.panelButtons.includes('reset_hwid')) {
-    row2.addComponents(new ButtonBuilder().setCustomId('reset_hwid').setLabel(t(lang, 'btn_reset_hwid')).setEmoji(emo('reset_hwid', '🔄')).setStyle(ButtonStyle.Danger));
-  }
-
-  const rows = [row1];
-  if (row2.components.length > 0) rows.push(row2);
   return rows;
+}
+
+// Brouillon de panel : l'owner choisit boutons + produits AVANT la publication.
+function renderPanelDraft(g, draft) {
+  const lang = g.config.language;
+  const L = mk(lang);
+  for (const id of [...draft.productIds]) if (!g.products[id]) draft.productIds.delete(id);
+
+  const buttonSelect = new StringSelectMenuBuilder()
+    .setCustomId('panel_sel_buttons')
+    .setPlaceholder(L('1️⃣ Choisis les boutons du panel', '1️⃣ Choose the panel buttons'))
+    .setMinValues(1)
+    .setMaxValues(PANEL_BUTTON_IDS.length)
+    .addOptions(PANEL_BUTTON_IDS.map((id) => ({ label: t(lang, BUTTON_DEFS[id].label), value: id, default: draft.buttons.has(id) })));
+  const rows = [new ActionRowBuilder().addComponents(buttonSelect)];
+
+  const productEntries = Object.entries(g.products).slice(0, 25);
+  if (productEntries.length) {
+    const productSelect = new StringSelectMenuBuilder()
+      .setCustomId('panel_sel_products')
+      .setPlaceholder(L('2️⃣ Choisis les produits du panel', '2️⃣ Choose the panel products'))
+      .setMinValues(1)
+      .setMaxValues(productEntries.length)
+      .addOptions(productEntries.map(([id, p]) => ({ label: String(p.name).slice(0, 100), value: id, default: draft.productIds.has(id) })));
+    rows.push(new ActionRowBuilder().addComponents(productSelect));
+  }
+
+  const ready = draft.buttons.size > 0 && draft.productIds.size > 0;
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('panel_add_product').setLabel(L('Ajouter un produit', 'Add a product')).setEmoji('📦').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('panel_publish').setLabel(L('Publier le panel', 'Publish panel')).setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(!ready),
+    new ButtonBuilder().setCustomId('panel_cancel').setLabel(L('Annuler', 'Cancel')).setStyle(ButtonStyle.Danger),
+  ));
+
+  const content = [
+    L('**Configuration du panel**', '**Panel setup**'),
+    L('1️⃣ Choisis les boutons à afficher.', '1️⃣ Choose the buttons to show.'),
+    productEntries.length
+      ? L('2️⃣ Choisis les produits du panel.', '2️⃣ Choose the products for the panel.')
+      : L("2️⃣ Aucun produit pour l'instant : ajoutes-en un avec 📦.", '2️⃣ No product yet: add one with 📦.'),
+    L('3️⃣ Clique sur **Publier** (le panel sera envoyé dans ce salon).', '3️⃣ Click **Publish** (the panel will be posted in this channel).'),
+  ].join('\n');
+  return { content, components: rows };
 }
 
 // ----------------------------------------------------------------
 // SUIVI DES PANELS PUBLIÉS (pour les mettre à jour automatiquement)
 // ----------------------------------------------------------------
-async function trackPanel(message) {
-  const panels = loadPanels();
-  panels.push({ messageId: message.id, channelId: message.channelId, createdAt: Date.now() });
-  await savePanels(panels);
+async function trackPanel(gid, g, message, panel) {
+  g.panels.push({ messageId: message.id, channelId: message.channelId, createdAt: Date.now(), buttons: panel.buttons, productIds: panel.productIds });
+  await db.save(gid);
 }
 
-async function updatePanelByRecord(record) {
+async function updatePanelByRecord(gid, g, record) {
   try {
     const channel = await client.channels.fetch(record.channelId);
     const message = await channel.messages.fetch(record.messageId);
-    await message.edit({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
+    await message.edit({ embeds: [buildPanelEmbed(g, record)], components: buildPanelButtons(g, record) });
     return { ok: true };
   } catch (e) {
     console.error('Erreur mise à jour panel :', e.code || '', e.message);
@@ -169,73 +199,69 @@ async function updatePanelByRecord(record) {
     // ou salon supprimé). Pour toute autre erreur (permissions, réseau...),
     // on le garde en suivi et on remonte le vrai message d'erreur.
     const reallyGone = e.code === 10008 || e.code === 10003;
-    if (reallyGone) await savePanels(loadPanels().filter((p) => p.messageId !== record.messageId));
+    if (reallyGone) { g.panels = g.panels.filter((p) => p.messageId !== record.messageId); await db.save(gid); }
     return { ok: false, reason: reallyGone ? 'gone' : (e.message || 'inconnue') };
   }
 }
 
 // Appelée après toute commande qui change l'apparence du panel. Si aucun
-// panel n'existe encore, rien à faire (les prochains /panel utiliseront
-// les nouveaux réglages automatiquement). Sinon, on demande TOUJOURS quoi
+// panel n'existe encore, rien à faire. Sinon, on demande TOUJOURS quoi
 // faire — jamais de mise à jour silencieuse.
-async function offerPanelUpdate(interaction) {
-  const panels = loadPanels();
+async function offerPanelUpdate(interaction, g) {
+  const L = mk(g.config.language);
+  const panels = g.panels;
   if (panels.length === 0) return;
 
   const row = new ActionRowBuilder();
   if (panels.length === 1) {
     row.addComponents(
-      new ButtonBuilder().setCustomId('panelupdate_latest').setLabel('✅ Appliquer au panel existant').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('panelupdate_cancel').setLabel('Ne pas appliquer').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId('panelupdate_latest').setLabel(L('✅ Appliquer au panel existant', '✅ Apply to the existing panel')).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('panelupdate_cancel').setLabel(L('Ne pas appliquer', "Don't apply")).setStyle(ButtonStyle.Secondary),
     );
   } else {
     row.addComponents(
-      new ButtonBuilder().setCustomId('panelupdate_latest').setLabel('Le plus récent').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('panelupdate_pick').setLabel('Choisir lequel').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('panelupdate_cancel').setLabel('Ne pas appliquer').setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId('panelupdate_latest').setLabel(L('Le plus récent', 'Most recent')).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('panelupdate_pick').setLabel(L('Choisir lequel', 'Pick one')).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('panelupdate_cancel').setLabel(L('Ne pas appliquer', "Don't apply")).setStyle(ButtonStyle.Danger),
     );
   }
   await interaction.followUp({
     content: panels.length === 1
-      ? 'Un panel existe déjà. Veux-tu lui appliquer ce changement ?'
-      : `Plusieurs panels existent (${panels.length}). Lequel mettre à jour ?`,
+      ? L('Un panel existe déjà. Veux-tu lui appliquer ce changement ?', 'A panel already exists. Apply this change to it?')
+      : L(`Plusieurs panels existent (${panels.length}). Lequel mettre à jour ?`, `Several panels exist (${panels.length}). Which one should be updated?`),
     components: [row],
     ephemeral: true,
   });
 }
 
 // ----------------------------------------------------------------
-// GÉNÉRATION DE CLÉS
+// GÉNÉRATION DE CLÉS (toujours dans le serveur concerné)
 // ----------------------------------------------------------------
-async function issueKeyForUser(userId, productId, { bypassStock = false } = {}) {
-  const products = loadProducts();
-  const product = products[productId];
+async function issueKeyForUser(gid, g, userId, productId, { bypassStock = false } = {}) {
+  const product = g.products[productId];
   if (!product) return { error: "Ce produit n'existe plus." };
 
-  const keys = loadKeys();
-  const existing = keys.find((k) => k.userId === userId && k.productId === productId);
+  const existing = g.keys.find((k) => k.userId === userId && k.productId === productId);
   if (existing) return { key: existing.key, alreadyExisted: true };
 
-  if (!bypassStock && product.stock && product.stock > 0 && issuedCountForProduct(keys, productId) >= product.stock) {
+  if (!bypassStock && product.stock && product.stock > 0 && issuedCountForProduct(g, productId) >= product.stock) {
     return { error: 'Stock épuisé pour ce produit.' };
   }
 
   const now = Date.now();
   const expiresAt = product.expireDays && product.expireDays > 0 ? now + product.expireDays * 86400000 : null;
   const record = { key: generateKeyString(), productId, userId, hwid: null, hwidResetAt: null, createdAt: now, claimedAt: now, expiresAt, redeemedAt: null };
-  keys.push(record);
-  await saveKeys(keys);
+  g.keys.push(record);
+  await db.save(gid);
   return { key: record.key, alreadyExisted: false };
 }
 
-async function bulkGenerate(productId, quantity, { bypassStock = false } = {}) {
-  const products = loadProducts();
-  const product = products[productId];
+async function bulkGenerate(gid, g, productId, quantity, { bypassStock = false } = {}) {
+  const product = g.products[productId];
   if (!product) return { error: "Ce produit n'existe plus." };
 
-  const keys = loadKeys();
   if (!bypassStock && product.stock && product.stock > 0) {
-    const remaining = product.stock - issuedCountForProduct(keys, productId);
+    const remaining = product.stock - issuedCountForProduct(g, productId);
     if (quantity > remaining) return { error: `Stock insuffisant (il reste ${remaining} place(s)).` };
   }
 
@@ -243,14 +269,15 @@ async function bulkGenerate(productId, quantity, { bypassStock = false } = {}) {
   const generated = [];
   for (let i = 0; i < quantity; i++) {
     const record = { key: generateKeyString(), productId, userId: null, hwid: null, hwidResetAt: null, createdAt: now, claimedAt: null, expiresAt: null, redeemedAt: null };
-    keys.push(record);
+    g.keys.push(record);
     generated.push(record.key);
   }
-  await saveKeys(keys);
+  await db.save(gid);
   return { keys: generated };
 }
 
-async function createProductFromScriptInput({ id, name, stock, expireDays, scriptInput }) {
+async function createProductFromScriptInput(gid, g, { id, name, stock, expireDays, scriptInput }) {
+  if (g.products[id]) throw new Error('PRODUCT_EXISTS');
   const input = scriptInput.trim();
   let rawContent = input;
   if (/^https?:\/\//i.test(input)) {
@@ -258,9 +285,8 @@ async function createProductFromScriptInput({ id, name, stock, expireDays, scrip
   }
   const obfuscated = obfuscateScript(rawContent);
   const hostedFilename = `${crypto.randomBytes(24).toString('hex')}.lua`;
-  const products = loadProducts();
-  products[id] = { name, script: obfuscated, rawScript: rawContent, hostedFilename, stock, expireDays, killswitch: false };
-  await saveProducts(products);
+  g.products[id] = { name, script: obfuscated, rawScript: rawContent, hostedFilename, stock, expireDays, killswitch: false };
+  await db.save(gid);
 }
 
 async function dmUser(user, content) {
@@ -283,51 +309,43 @@ function fetchUrl(url, redirects = 0) {
   });
 }
 
-function buildHostedLoader(record, product) {
-  const base = process.env.PUBLIC_URL || null;
+// Loader COURT (2 lignes). Le calcul du HWID n'est plus collé dans le
+// message : il est fourni par le serveur (route /l/<clé>, voir server.js).
+function buildHostedLoader(record) {
+  const base = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
   if (!base) {
     return [
-      '-- ⚠️ PUBLIC_URL n\'est pas configuré côté serveur, demande à aln de finir la config.',
+      "-- ⚠️ PUBLIC_URL n'est pas configuré côté serveur, demande à aln de finir la config.",
       `script_key = "${record.key}"`,
     ].join('\n');
   }
-  // Identifiant d'appareil : on essaie les fonctions exposées par les
-  // executors (gethwid, get_hwid, syn.crypto.hwid), puis l'ID client Roblox
-  // en dernier recours. (identifyexecutor() n'est PAS utilisé : il renvoie
-  // le nom de l'executor, identique pour tous les joueurs.) Si rien ne
-  // marche, on envoie "unknown" : le serveur autorise mais ne verrouille pas.
-  const hwidSnippet = [
-    'local function _mo_hwid()',
-    '  local ok, id = pcall(function()',
-    '    if gethwid then return gethwid() end',
-    '    if get_hwid then return get_hwid() end',
-    '    if syn and syn.crypto and syn.crypto.hwid then return syn.crypto.hwid() end',
-    '    return game:GetService("RbxAnalyticsService"):GetClientId()',
-    '  end)',
-    '  if ok and id and tostring(id) ~= "" then return tostring(id) end',
-    '  return "unknown"',
-    'end',
-  ].join('\n');
-  const url = `${base.replace(/\/$/, '')}/scripts/hosted/${product.hostedFilename}?key=${record.key}&hwid=`;
   return [
     `script_key = "${record.key}"`,
-    '',
-    hwidSnippet,
-    `loadstring(game:HttpGet("${url}" .. game:GetService("HttpService"):UrlEncode(_mo_hwid())))()`,
+    `loadstring(game:HttpGet("${base}/l/${record.key}"))()`,
   ].join('\n');
-}
-
-async function sendScriptInChunks(sendFn, scriptContent) {
-  const chunks = scriptContent.match(/[\s\S]{1,1900}/g) || [];
-  for (const chunk of chunks) await sendFn(`\`\`\`lua\n${chunk}\n\`\`\``);
 }
 
 // ----------------------------------------------------------------
 // SLASH COMMANDS
 // ----------------------------------------------------------------
 const commands = [
-  new SlashCommandBuilder().setName('panel').setDescription('Affiche le panel de distribution'),
-  new SlashCommandBuilder().setName('help').setDescription('Affiche l\'aide et les commandes disponibles'),
+  new SlashCommandBuilder().setName('start').setDescription('(Propriétaire du serveur) Configure le bot : langue et visibilité. Obligatoire avant tout.'),
+
+  new SlashCommandBuilder()
+    .setName('permissions')
+    .setDescription('(Propriétaire du serveur) Choisis qui peut utiliser les commandes du bot')
+    .addSubcommand((s) => s.setName('add-role').setDescription('Autoriser un rôle')
+      .addRoleOption((o) => o.setName('role').setDescription('Le rôle').setRequired(true)))
+    .addSubcommand((s) => s.setName('remove-role').setDescription('Retirer un rôle')
+      .addRoleOption((o) => o.setName('role').setDescription('Le rôle').setRequired(true)))
+    .addSubcommand((s) => s.setName('add-user').setDescription('Autoriser une personne')
+      .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true)))
+    .addSubcommand((s) => s.setName('remove-user').setDescription('Retirer une personne')
+      .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true)))
+    .addSubcommand((s) => s.setName('list').setDescription('Voir qui est autorisé')),
+
+  new SlashCommandBuilder().setName('panel').setDescription('(Admin) Crée et publie un panel (tu choisis les boutons et les produits)'),
+  new SlashCommandBuilder().setName('help').setDescription('(Admin) Affiche l\'aide et les commandes disponibles'),
 
   new SlashCommandBuilder()
     .setName('addproduct')
@@ -336,7 +354,7 @@ const commands = [
     .addIntegerOption((o) => o.setName('stock').setDescription('Nombre max de clés (0 = illimité)').setRequired(false))
     .addIntegerOption((o) => o.setName('expiration_jours').setDescription("Durée de validité en jours (0 = jamais)").setRequired(false)),
 
-  new SlashCommandBuilder().setName('listproducts').setDescription('Liste les produits configurés'),
+  new SlashCommandBuilder().setName('listproducts').setDescription('(Admin) Liste les produits configurés'),
 
   new SlashCommandBuilder()
     .setName('removeproduct')
@@ -444,7 +462,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('language')
-    .setDescription('(Admin) Langue utilisée pour les messages vus par les acheteurs')
+    .setDescription('(Admin) Change la langue du bot (voir aussi /start)')
     .addStringOption((o) => o.setName('langue').setDescription('Langue').setRequired(true)
       .addChoices(
         { name: 'English', value: 'en' },
@@ -467,10 +485,9 @@ const commands = [
         { name: 'Reset HWID', value: 'reset_hwid' },
       ))
     .addStringOption((o) => o.setName('emoji').setDescription('Le nouvel emoji, ex: 🔥').setRequired(true)),
-].map((c) => c.toJSON());
+].map((c) => c.setDMPermission(false).toJSON());
 
-// Commandes globales (tous serveurs où le bot est présent), réservées à
-// OWNER_ID. Enregistrées séparément des autres pour être disponibles partout.
+// Commandes globales réservées à OWNER_ID (toi), utilisables partout.
 const ownerCommands = [
   new SlashCommandBuilder().setName('ownerinfo').setDescription('Statistiques du bot (toi uniquement, dans tous les serveurs)'),
   new SlashCommandBuilder()
@@ -483,15 +500,14 @@ const ownerCommands = [
     .addStringOption((o) => o.setName('guild_id').setDescription("L'ID du serveur").setRequired(true)),
 ].map((c) => c.toJSON());
 
-// Toutes les commandes sont désormais enregistrées en GLOBAL (pas limitées
-// à un seul serveur) pour que le bot fonctionne partout où on l'ajoute.
-// Ça peut prendre jusqu'à 1h pour apparaître partout (contre instantané
-// avant, quand c'était limité à un seul serveur).
+// Toutes les commandes sont enregistrées en GLOBAL (tous serveurs où le bot
+// est présent). Ça peut prendre un peu de temps pour apparaître partout.
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: [...commands, ...ownerCommands] });
-    console.log('Commandes slash enregistrées en global (tous serveurs).');
+    const body = [...commands, ...ownerCommands];
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body });
+    console.log(`Commandes slash enregistrées en global (${body.length} commandes).`);
     if (process.env.GUILD_ID) {
       // Nettoie les anciennes commandes propres au serveur (avant le passage
       // au global) pour éviter que chaque commande apparaisse deux fois.
@@ -502,15 +518,54 @@ async function registerCommands() {
   }
 }
 
+// ----------------------------------------------------------------
+// SERVEURS : chaque serveur démarre à zéro à l'ajout du bot
+// ----------------------------------------------------------------
+// Discord donne la date d'arrivée du bot (joinedTimestamp). Si elle change,
+// c'est que le bot a été retiré puis ré-ajouté → on remet tout à zéro.
+async function syncGuildRecord(guild) {
+  const existing = db.peek(guild.id);
+  const joined = guild.joinedTimestamp || null;
+  if (!existing) {
+    const g = db.get(guild.id);
+    g.botJoinedAt = joined;
+    await db.save(guild.id);
+    return 'new';
+  }
+  if (existing.botJoinedAt && joined && Math.abs(existing.botJoinedAt - joined) > 60000) {
+    await db.reset(guild.id, joined);
+    return 'reset';
+  }
+  if (!existing.botJoinedAt && joined) { existing.botJoinedAt = joined; await db.save(guild.id); }
+  return 'ok';
+}
+
+async function promptOwnerToStart(guild) {
+  try {
+    const owner = await guild.fetchOwner();
+    await owner.send(
+      `👋 Merci d'avoir ajouté **${APP_CONFIG.BOT_NAME}** sur **${guild.name}** !\n` +
+      `Lance \`/start\` sur le serveur pour le configurer (rien ne fonctionne avant).\n\n` +
+      `👋 Thanks for adding **${APP_CONFIG.BOT_NAME}** to **${guild.name}**!\n` +
+      `Run \`/start\` on the server to set it up (nothing works before that).`
+    );
+  } catch (e) { /* DM fermés : pas grave, le message "pas configuré" guidera */ }
+}
+
 client.once(Events.ClientReady, async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
   console.log(`Serveurs actuels (${client.guilds.cache.size}) :`, [...client.guilds.cache.values()].map((g) => `${g.name} (${g.id})`).join(' | '));
+  for (const guild of client.guilds.cache.values()) {
+    const status = await syncGuildRecord(guild);
+    if (status === 'reset') console.log(`♻️ Bot ré-ajouté à ${guild.name} : données remises à zéro.`);
+  }
   await registerCommands();
 });
 
-// Logs pour diagnostiquer si le bot rejoint/quitte bien un serveur.
-client.on(Events.GuildCreate, (guild) => {
-  console.log(`✅ Bot ajouté à un nouveau serveur : ${guild.name} (${guild.id})`);
+client.on(Events.GuildCreate, async (guild) => {
+  const status = await syncGuildRecord(guild);
+  console.log(`✅ Bot ajouté au serveur : ${guild.name} (${guild.id}) [${status}]`);
+  if (status !== 'ok') await promptOwnerToStart(guild);
 });
 client.on(Events.GuildDelete, (guild) => {
   console.log(`❌ Bot retiré d'un serveur : ${guild.name || guild.id}`);
@@ -520,825 +575,958 @@ client.on(Events.GuildDelete, (guild) => {
 // AUTO-GÉNÉRATION QUAND UN RÔLE LIÉ EST ATTRIBUÉ
 // ----------------------------------------------------------------
 client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
-  const blacklist = loadBlacklist();
-  if (blacklist[newMember.id]) return;
+  const gid = newMember.guild.id;
+  const g = db.peek(gid);
+  if (!g || !g.setupDone) return;
+  if (g.blacklist[newMember.id]) return;
 
-  const roleMap = loadRoleMap();
+  const lang = g.config.language;
   const newRoles = newMember.roles.cache.filter((r) => !oldMember.roles.cache.has(r.id));
 
   for (const [, role] of newRoles) {
-    const productId = roleMap[role.id];
+    const productId = g.roleMap[role.id];
     if (!productId) continue;
-    const result = await issueKeyForUser(newMember.id, productId);
+    const result = await issueKeyForUser(gid, g, newMember.id, productId);
     if (result.error || result.alreadyExisted) continue;
-    const products = loadProducts();
     await dmUser(newMember.user, {
       embeds: [
         new EmbedBuilder()
           .setColor(APP_CONFIG.EMBED_COLOR)
-          .setTitle('🔑 Nouvelle clé générée')
-          .setDescription(`Produit : **${products[productId]?.name || productId}**\n\`\`\`${result.key}\`\`\`\nUtilise le panel du serveur pour recevoir le script.`),
+          .setTitle(t(lang, 'new_key_title'))
+          .setDescription(t(lang, 'new_key_desc', { product: g.products[productId]?.name || productId, key: result.key })),
       ],
     });
   }
 });
 
 // ----------------------------------------------------------------
-// INTERACTIONS
+// COMMANDES DU PROPRIÉTAIRE DU BOT (toi) — /ownerinfo, /disableguild, /enableguild
 // ----------------------------------------------------------------
-client.on(Events.InteractionCreate, async (interaction) => {
-  try {
-    // Serveur désactivé par le propriétaire : on bloque tout, sauf pour
-    // OWNER_ID lui-même (qui doit toujours pouvoir gérer/réactiver).
-    if (interaction.guildId && interaction.user.id !== process.env.OWNER_ID) {
-      const disabledGuilds = loadConfig().disabledGuildIds || [];
-      if (disabledGuilds.includes(interaction.guildId)) {
-        if (interaction.isRepliable()) {
-          await interaction.reply({ content: '❌ Ce bot est désactivé sur ce serveur.', ephemeral: true }).catch(() => {});
-        }
-        return;
-      }
-    }
+async function handleOwnerCommand(interaction) {
+  const cmd = interaction.commandName;
+  await interaction.deferReply({ ephemeral: true });
+  if (!isBotOwner(interaction.user.id)) {
+    await interaction.editReply({ content: '❌ Cette commande est réservée au propriétaire du bot (OWNER_ID).' });
+    return;
+  }
+  const glob = db.getGlobal();
+  const disabled = glob.disabledGuildIds || [];
 
-    // --- Autocomplete produit ---
-    if (interaction.isAutocomplete()) {
-      const focused = interaction.options.getFocused().toLowerCase();
-      const products = loadProducts();
-      const choices = Object.entries(products)
-        .filter(([id, p]) => p.name.toLowerCase().includes(focused) || id.includes(focused))
-        .slice(0, 24)
-        .map(([id, p]) => ({ name: p.name, value: id }));
-      if (interaction.commandName === 'killswitch') choices.unshift({ name: 'Tous les produits', value: 'tous' });
-      await interaction.respond(choices.slice(0, 25));
+  if (cmd === 'ownerinfo') {
+    // On croise le cache du bot ET la liste officielle Discord (API), pour ne
+    // rater aucun serveur où le bot a été ajouté.
+    const rows = new Map();
+    for (const gd of client.guilds.cache.values()) rows.set(gd.id, { id: gd.id, name: gd.name, ownerId: gd.ownerId, members: gd.memberCount });
+    try {
+      const fetched = await client.guilds.fetch();
+      for (const og of fetched.values()) if (!rows.has(og.id)) rows.set(og.id, { id: og.id, name: og.name, ownerId: null, members: null });
+    } catch (e) { console.error('ownerinfo : liste API impossible :', e.message); }
+
+    const list = [...rows.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    const lines = list.map((r) => {
+      const gs = db.peek(r.id);
+      const status = [gs?.setupDone ? '✅ /start fait' : '⏳ /start pas fait', disabled.includes(r.id) ? '🔴 désactivé' : null].filter(Boolean).join(' · ');
+      return `**${r.name}**\nID : \`${r.id}\`\n👑 ${r.ownerId ? `<@${r.ownerId}>` : '?'} · 👥 ${r.members ?? '?'}\n${status}`;
+    });
+
+    const pages = [];
+    let cur = '';
+    for (const line of lines) {
+      if ((cur + '\n\n' + line).length > 3800) { pages.push(cur); cur = line; }
+      else cur = cur ? `${cur}\n\n${line}` : line;
+    }
+    if (cur) pages.push(cur);
+    if (pages.length === 0) pages.push('Aucun serveur.');
+
+    const title = `📡 Ton bot est dans ${list.length} serveur(s)`;
+    const mkEmbed = (text, i) => new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(i === 0 ? title : `${title} (suite)`).setDescription(text);
+    await interaction.editReply({ embeds: [mkEmbed(pages[0], 0)], allowedMentions: { parse: [] } });
+    for (let i = 1; i < pages.length; i++) await interaction.followUp({ embeds: [mkEmbed(pages[i], i)], ephemeral: true, allowedMentions: { parse: [] } });
+    return;
+  }
+
+  // disableguild / enableguild
+  const guildId = interaction.options.getString('guild_id').trim();
+  const targetGuild = client.guilds.cache.get(guildId);
+  if (!targetGuild) { await interaction.editReply({ content: "❌ Le bot n'est pas dans un serveur avec cet ID." }); return; }
+  const set = new Set(disabled);
+  if (cmd === 'disableguild') set.add(guildId); else set.delete(guildId);
+  glob.disabledGuildIds = [...set];
+  await db.saveGlobal();
+  await interaction.editReply({
+    content: cmd === 'disableguild' ? `🔴 Bot désactivé sur **${targetGuild.name}**.` : `🟢 Bot réactivé sur **${targetGuild.name}**.`,
+  });
+}
+
+// ----------------------------------------------------------------
+// /start : configuration obligatoire (langue + visibilité)
+// ----------------------------------------------------------------
+async function handleStartCommand(interaction, guild) {
+  if (!(isBotOwner(interaction.user.id) || isGuildOwner(interaction, guild))) {
+    await interaction.reply({ content: '❌ Seul le propriétaire du serveur peut lancer `/start`.\n❌ Only the server owner can run `/start`.', ephemeral: true });
+    return;
+  }
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('start_lang')
+    .setPlaceholder('🌍 Language / Langue')
+    .addOptions([
+      { label: 'English', value: 'en' },
+      { label: 'Français', value: 'fr' },
+      { label: 'Español', value: 'es', description: 'English for now / anglais pour le moment' },
+      { label: 'Português', value: 'pt', description: 'English for now / anglais pour le moment' },
+      { label: 'Deutsch', value: 'de', description: 'English for now / anglais pour le moment' },
+    ]);
+  await interaction.reply({
+    content: '🌍 **Configuration — étape 1/2**\nDans quelle langue le bot doit-il te parler (et parler à tes membres) ?\n\n**Setup — step 1/2**\nWhich language should the bot use with you (and your members)?',
+    components: [new ActionRowBuilder().addComponents(select)],
+    ephemeral: true,
+  });
+}
+
+async function handleStartComponent(interaction, guild, g) {
+  if (!(isBotOwner(interaction.user.id) || isGuildOwner(interaction, guild))) {
+    await interaction.reply({ content: '❌ Seul le propriétaire du serveur peut faire ça. / Only the server owner can do this.', ephemeral: true });
+    return;
+  }
+
+  if (interaction.isStringSelectMenu() && interaction.customId === 'start_lang') {
+    const lang = interaction.values[0];
+    if (!SUPPORTED_LANGS.includes(lang)) return;
+    const L = mk(lang);
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`start_vis:${lang}:public`).setLabel(L('Visibles par tous', 'Visible to everyone')).setEmoji('👁️').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`start_vis:${lang}:private`).setLabel(L('Privées (seulement la personne)', 'Private (only the person)')).setEmoji('🔒').setStyle(ButtonStyle.Primary),
+    );
+    await interaction.update({
+      content: L(
+        "👁️ **Configuration — étape 2/2**\nLes réponses du bot (celles qui ne contiennent pas de clé) doivent-elles être **visibles par tout le monde** dans le salon, ou **privées** (seulement la personne qui a fait la commande) ?\n_Les clés et scripts restent toujours privés._",
+        "👁️ **Setup — step 2/2**\nShould bot replies (the ones that don't contain a key) be **visible to everyone** in the channel, or **private** (only the person who used the command)?\n_Keys and scripts are always private._",
+      ),
+      components: [row],
+    });
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('start_vis:')) {
+    const [, lang, vis] = interaction.customId.split(':');
+    if (!SUPPORTED_LANGS.includes(lang) || !['public', 'private'].includes(vis)) return;
+    const L = mk(lang);
+    g.config.language = lang;
+    g.config.visibility = vis;
+    g.setupDone = true;
+    g.setupAt = Date.now();
+    await db.save(guild.id);
+    await interaction.update({
+      content: L(
+        `✅ **Configuration terminée !**\nLangue : \`${lang}\` · Réponses : ${vis === 'public' ? 'visibles par tous' : 'privées'}\n\n**Étapes suivantes**\n1. \`/addproduct\` pour ajouter un produit\n2. \`/panel\` pour créer un panel (tu choisis les boutons et les produits)\n3. \`/permissions\` pour autoriser d'autres rôles/personnes à utiliser le bot\n\nTu peux relancer \`/start\` à tout moment pour changer ces réglages.`,
+        `✅ **Setup complete!**\nLanguage: \`${lang}\` · Replies: ${vis === 'public' ? 'visible to everyone' : 'private'}\n\n**Next steps**\n1. \`/addproduct\` to add a product\n2. \`/panel\` to create a panel (you choose the buttons and products)\n3. \`/permissions\` to allow other roles/people to use the bot\n\nYou can run \`/start\` again at any time to change these settings.`,
+      ),
+      components: [],
+    });
+  }
+}
+
+// ----------------------------------------------------------------
+// COMMANDES ADMIN (propriétaire du serveur + personnes/rôles autorisés)
+// ----------------------------------------------------------------
+async function handleChatCommand(interaction, guild, g) {
+  const cmd = interaction.commandName;
+  const gid = guild.id;
+  const uid = interaction.user.id;
+  const lang = g.config.language;
+  const L = mk(lang);
+  const reply = (content) => interaction.editReply({ content, allowedMentions: { parse: [] } });
+
+  // /panel : ouvre le brouillon (boutons + produits à choisir AVANT publication)
+  if (cmd === 'panel') {
+    const draft = { buttons: new Set(), productIds: new Set(), channelId: interaction.channelId, createdAt: Date.now() };
+    panelDrafts.set(`${gid}:${uid}`, draft);
+    await interaction.reply({ ...renderPanelDraft(g, draft), ephemeral: true });
+    return;
+  }
+
+  // /addproduct ouvre une fenêtre : doit être la toute première réponse
+  if (cmd === 'addproduct') {
+    const name = interaction.options.getString('nom');
+    const stock = interaction.options.getInteger('stock') || 0;
+    const expireDays = interaction.options.getInteger('expiration_jours') || 0;
+    const id = slugify(name);
+    if (g.products[id]) { await interaction.reply({ content: L('❌ Un produit avec ce nom existe déjà.', '❌ A product with this name already exists.'), ephemeral: true }); return; }
+    pendingProducts.set(`${gid}:${uid}`, { id, name, stock, expireDays });
+    const modal = new ModalBuilder().setCustomId('modal_addproduct').setTitle(L(`Script pour ${name}`, `Script for ${name}`).slice(0, 45));
+    const scriptInput = new TextInputBuilder().setCustomId('script_content').setLabel(L('Lien Pastebin/Pastefy (raw) ou code', 'Pastebin/Pastefy (raw) link or code')).setStyle(TextInputStyle.Paragraph).setRequired(true);
+    modal.addComponents(new ActionRowBuilder().addComponents(scriptInput));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  // Les réponses contenant des clés / données perso sont TOUJOURS privées ;
+  // les autres suivent le réglage choisi dans /start.
+  await interaction.deferReply({ ephemeral: SENSITIVE_CMDS.has(cmd) || g.config.visibility !== 'public' });
+
+  if (cmd === 'permissions') {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'add-role' || sub === 'remove-role') {
+      const role = interaction.options.getRole('role');
+      if (sub === 'add-role') {
+        if (role.id === gid) { await reply(L("❌ Impossible d'autoriser @everyone (tout le monde pourrait gérer le bot).", '❌ You cannot allow @everyone (everyone could manage the bot).')); return; }
+        if (!g.allowedRoles.includes(role.id)) g.allowedRoles.push(role.id);
+      } else {
+        g.allowedRoles = g.allowedRoles.filter((r) => r !== role.id);
+      }
+      await db.save(gid);
+      await reply(sub === 'add-role' ? L(`✅ Le rôle <@&${role.id}> peut maintenant utiliser les commandes.`, `✅ Role <@&${role.id}> can now use the commands.`) : L(`✅ Le rôle <@&${role.id}> n'a plus accès aux commandes.`, `✅ Role <@&${role.id}> can no longer use the commands.`));
+      return;
+    }
+    if (sub === 'add-user' || sub === 'remove-user') {
+      const target = interaction.options.getUser('utilisateur');
+      if (sub === 'add-user') { if (!g.allowedUsers.includes(target.id)) g.allowedUsers.push(target.id); }
+      else g.allowedUsers = g.allowedUsers.filter((u) => u !== target.id);
+      await db.save(gid);
+      await reply(sub === 'add-user' ? L(`✅ <@${target.id}> peut maintenant utiliser les commandes.`, `✅ <@${target.id}> can now use the commands.`) : L(`✅ <@${target.id}> n'a plus accès aux commandes.`, `✅ <@${target.id}> can no longer use the commands.`));
+      return;
+    }
+    // list
+    await reply([
+      L('👑 Propriétaire du serveur : toujours autorisé.', '👑 Server owner: always allowed.'),
+      L('🎭 **Rôles autorisés** : ', '🎭 **Allowed roles**: ') + (g.allowedRoles.map((r) => `<@&${r}>`).join(' ') || L('aucun', 'none')),
+      L('👤 **Personnes autorisées** : ', '👤 **Allowed people**: ') + (g.allowedUsers.map((u) => `<@${u}>`).join(' ') || L('aucune', 'none')),
+    ].join('\n'));
+    return;
+  }
+
+  if (cmd === 'listproducts') {
+    const entries = Object.entries(g.products);
+    if (entries.length === 0) { await reply(L('Aucun produit configuré.', 'No product configured.')); return; }
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(L('📦 Produits', '📦 Products'));
+    for (const [id, p] of entries.slice(0, 25)) {
+      const issued = issuedCountForProduct(g, id);
+      const stockStr = p.stock && p.stock > 0 ? `${issued}/${p.stock}` : `${issued}/∞`;
+      const expStr = p.expireDays && p.expireDays > 0 ? `${p.expireDays}${L('j', 'd')}` : L('jamais', 'never');
+      embed.addFields({ name: `${p.name} (${id})${p.killswitch ? ' 🔒' : ''}`, value: `Stock: ${stockStr} | ${L('Expiration', 'Expiry')}: ${expStr}` });
+    }
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (cmd === 'help') {
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(t(lang, 'help_title')).setDescription(L(
+      'Toutes les commandes sont réservées au propriétaire du serveur et aux personnes/rôles autorisés avec `/permissions`.',
+      'All commands are reserved for the server owner and the people/roles allowed with `/permissions`.',
+    ));
+    embed.addFields({
+      name: L('Commandes', 'Commands'),
+      value: [
+        L('**Démarrage** : `/start` `/permissions` `/panel`', '**Getting started**: `/start` `/permissions` `/panel`'),
+        L('**Produits** : `/addproduct` `/listproducts` `/removeproduct` `/setrole`', '**Products**: `/addproduct` `/listproducts` `/removeproduct` `/setrole`'),
+        L('**Clés** : `/genkey` `/whitelist` `/bulkgen` `/revokekey` `/deletekey` `/deleteuserkeys` `/lookupkey` `/lookupuser`', '**Keys**: `/genkey` `/whitelist` `/bulkgen` `/revokekey` `/deletekey` `/deleteuserkeys` `/lookupkey` `/lookupuser`'),
+        L('**Sécurité** : `/resetkeyhwid` `/sethwidcooldown` `/killswitch` `/blacklist` `/unblacklist`', '**Security**: `/resetkeyhwid` `/sethwidcooldown` `/killswitch` `/blacklist` `/unblacklist`'),
+        L('**Apparence** : `/setcolor` `/settitle` `/setdescription` `/setfooter` `/setemoji`', '**Appearance**: `/setcolor` `/settitle` `/setdescription` `/setfooter` `/setemoji`'),
+        L('**Autre** : `/language` `/stats`', '**Other**: `/language` `/stats`'),
+      ].join('\n'),
+    });
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (cmd === 'removeproduct') {
+    const id = interaction.options.getString('produit');
+    if (!g.products[id]) { await reply(L('❌ Produit introuvable.', '❌ Product not found.')); return; }
+    delete g.products[id];
+    for (const roleId of Object.keys(g.roleMap)) if (g.roleMap[roleId] === id) delete g.roleMap[roleId];
+    for (const p of g.panels) p.productIds = p.productIds.filter((x) => x !== id);
+    await db.save(gid);
+    await reply(L('✅ Produit supprimé.', '✅ Product removed.'));
+    await offerPanelUpdate(interaction, g);
+    return;
+  }
+
+  if (cmd === 'setrole') {
+    const role = interaction.options.getRole('role');
+    const productId = interaction.options.getString('produit');
+    if (!g.products[productId]) { await reply(L('❌ Produit introuvable.', '❌ Product not found.')); return; }
+    g.roleMap[role.id] = productId;
+    await db.save(gid);
+    await reply(L(`✅ <@&${role.id}> déclenche maintenant une clé pour **${g.products[productId].name}**.`, `✅ <@&${role.id}> now triggers a key for **${g.products[productId].name}**.`));
+    return;
+  }
+
+  if (cmd === 'genkey') {
+    const target = interaction.options.getUser('utilisateur');
+    const productId = interaction.options.getString('produit');
+    if (g.blacklist[target.id]) { await reply(L('❌ Cet utilisateur est blacklist.', '❌ This user is blacklisted.')); return; }
+    const result = await issueKeyForUser(gid, g, target.id, productId, { bypassStock: true });
+    if (result.error) { await reply(`❌ ${result.error}`); return; }
+    await reply(L(`✅ Clé pour <@${target.id}> : \`${result.key}\``, `✅ Key for <@${target.id}>: \`${result.key}\``));
+    return;
+  }
+
+  if (cmd === 'whitelist') {
+    const target = interaction.options.getUser('utilisateur');
+    const productId = interaction.options.getString('produit');
+    if (g.blacklist[target.id]) { await reply(L('❌ Cet utilisateur est blacklist.', '❌ This user is blacklisted.')); return; }
+    const linkedRoleId = Object.entries(g.roleMap).find(([, pid]) => pid === productId)?.[0];
+    if (linkedRoleId) {
+      try {
+        const member = await guild.members.fetch(target.id);
+        if (member.roles.cache.has(linkedRoleId)) {
+          await reply(L(`ℹ️ <@${target.id}> a déjà ce rôle. Utilise \`/genkey\` pour forcer une nouvelle clé.`, `ℹ️ <@${target.id}> already has this role. Use \`/genkey\` to force a new key.`));
+          return;
+        }
+        await member.roles.add(linkedRoleId);
+        await reply(L(`✅ Rôle <@&${linkedRoleId}> donné à <@${target.id}> — sa clé sera générée et envoyée automatiquement.`, `✅ Role <@&${linkedRoleId}> given to <@${target.id}> — their key will be generated and sent automatically.`));
+      } catch (e) {
+        await reply(L("❌ Impossible d'ajouter le rôle (permission Gérer les rôles / hiérarchie).", "❌ Couldn't add the role (Manage Roles permission / role hierarchy)."));
+      }
+      return;
+    }
+    const result = await issueKeyForUser(gid, g, target.id, productId, { bypassStock: true });
+    if (result.error) { await reply(`❌ ${result.error}`); return; }
+    await reply(L(`✅ Clé pour <@${target.id}> : \`${result.key}\` (aucun rôle lié, clé attribuée directement).`, `✅ Key for <@${target.id}>: \`${result.key}\` (no linked role, key assigned directly).`));
+    return;
+  }
+
+  if (cmd === 'bulkgen') {
+    const productId = interaction.options.getString('produit');
+    const quantity = interaction.options.getInteger('quantite');
+    if (quantity < 1 || quantity > 100) { await reply(L('❌ Quantité entre 1 et 100.', '❌ Quantity must be between 1 and 100.')); return; }
+    const result = await bulkGenerate(gid, g, productId, quantity, { bypassStock: true });
+    if (result.error) { await reply(`❌ ${result.error}`); return; }
+    await reply(L(`✅ ${quantity} clé(s) générée(s) :\n\`\`\`${result.keys.join('\n')}\`\`\``, `✅ ${quantity} key(s) generated:\n\`\`\`${result.keys.join('\n')}\`\`\``));
+    return;
+  }
+
+  if (cmd === 'revokekey' || cmd === 'deletekey') {
+    const value = interaction.options.getString('cle').trim().toUpperCase();
+    const idx = g.keys.findIndex((k) => k.key === value);
+    if (idx === -1) { await reply(L('❌ Clé introuvable.', '❌ Key not found.')); return; }
+    g.keys.splice(idx, 1);
+    await db.save(gid);
+    await reply(L('✅ Clé supprimée.', '✅ Key deleted.'));
+    return;
+  }
+
+  if (cmd === 'deleteuserkeys') {
+    const target = interaction.options.getUser('utilisateur');
+    const remaining = g.keys.filter((k) => k.userId !== target.id);
+    const removedCount = g.keys.length - remaining.length;
+    g.keys = remaining;
+    await db.save(gid);
+    await reply(L(`✅ ${removedCount} clé(s) supprimée(s) pour <@${target.id}>.`, `✅ ${removedCount} key(s) deleted for <@${target.id}>.`));
+    return;
+  }
+
+  if (cmd === 'lookupkey') {
+    const value = interaction.options.getString('cle').trim().toUpperCase();
+    const record = findKeyByValue(g, value);
+    if (!record) { await reply(L('❌ Clé introuvable.', '❌ Key not found.')); return; }
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(`🔎 ${record.key}`)
+      .addFields(
+        { name: L('Produit', 'Product'), value: g.products[record.productId]?.name || record.productId, inline: true },
+        { name: L('Propriétaire', 'Owner'), value: record.userId ? `<@${record.userId}>` : L('Non réclamée', 'Unclaimed'), inline: true },
+        { name: 'HWID', value: record.hwid || L('Aucun', 'None'), inline: true },
+        { name: L('Créée', 'Created'), value: fmtDate(record.createdAt, lang), inline: true },
+        { name: L('Réclamée', 'Claimed'), value: fmtDate(record.claimedAt, lang), inline: true },
+        { name: L('Expire', 'Expires'), value: record.expiresAt ? fmtDate(record.expiresAt, lang) : L('Jamais', 'Never'), inline: true },
+        { name: L('Utilisée', 'Used'), value: fmtDate(record.redeemedAt, lang), inline: true },
+        { name: L('Lancements', 'Launches'), value: `${record.useCount || 0}`, inline: true },
+        { name: L('Dernier lancement', 'Last launch'), value: fmtDate(record.lastUsedAt, lang), inline: true },
+      );
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (cmd === 'lookupuser') {
+    const target = interaction.options.getUser('utilisateur');
+    const userKeys = findKeysByUser(g, target.id);
+    if (userKeys.length === 0) { await reply(L(`${target.tag} n'a aucune clé.${g.blacklist[target.id] ? ' (Blacklist)' : ''}`, `${target.tag} has no key.${g.blacklist[target.id] ? ' (Blacklisted)' : ''}`)); return; }
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(L(`👤 Clés de ${target.tag}`, `👤 Keys of ${target.tag}`));
+    for (const k of userKeys.slice(0, 25)) {
+      embed.addFields({ name: g.products[k.productId]?.name || k.productId, value: `\`${k.key}\` — ${k.redeemedAt ? t(lang, 'word_used') : t(lang, 'word_unused')}` });
+    }
+    if (g.blacklist[target.id]) embed.setDescription(`⚠️ Blacklist : ${g.blacklist[target.id].reason}`);
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (cmd === 'resetkeyhwid') {
+    const value = interaction.options.getString('cle').trim().toUpperCase();
+    const record = findKeyByValue(g, value);
+    if (!record) { await reply(L('❌ Clé introuvable.', '❌ Key not found.')); return; }
+    record.hwid = null;
+    record.hwidResetAt = Date.now();
+    await db.save(gid);
+    await reply(L(`✅ HWID réinitialisé pour \`${record.key}\`.`, `✅ HWID reset for \`${record.key}\`.`));
+    return;
+  }
+
+  if (cmd === 'sethwidcooldown') {
+    const hours = interaction.options.getInteger('heures');
+    g.config.hwidCooldownHours = hours;
+    await db.save(gid);
+    await reply(L(`✅ Délai de reset HWID : ${hours}h.`, `✅ HWID reset delay: ${hours}h.`));
+    return;
+  }
+
+  if (cmd === 'killswitch') {
+    const productId = interaction.options.getString('produit');
+    const state = interaction.options.getString('etat') === 'on';
+    if (productId === 'tous') {
+      g.config.killswitchGlobal = state;
+      await db.save(gid);
+      await reply(L(`✅ Killswitch global : ${state ? 'activé (tout bloqué)' : 'désactivé'}.`, `✅ Global killswitch: ${state ? 'enabled (everything blocked)' : 'disabled'}.`));
+      await offerPanelUpdate(interaction, g);
+      return;
+    }
+    if (!g.products[productId]) { await reply(L('❌ Produit introuvable.', '❌ Product not found.')); return; }
+    g.products[productId].killswitch = state;
+    await db.save(gid);
+    await reply(L(`✅ ${g.products[productId].name} : ${state ? 'accès bloqué' : 'accès rétabli'}.`, `✅ ${g.products[productId].name}: ${state ? 'access blocked' : 'access restored'}.`));
+    await offerPanelUpdate(interaction, g);
+    return;
+  }
+
+  if (cmd === 'blacklist') {
+    const target = interaction.options.getUser('utilisateur');
+    const reason = interaction.options.getString('raison') || L('Non spécifiée', 'Not specified');
+    g.blacklist[target.id] = { reason, bannedAt: Date.now() };
+    await db.save(gid);
+    await reply(L(`✅ <@${target.id}> blacklist. Raison : ${reason}`, `✅ <@${target.id}> blacklisted. Reason: ${reason}`));
+    return;
+  }
+
+  if (cmd === 'unblacklist') {
+    const target = interaction.options.getUser('utilisateur');
+    delete g.blacklist[target.id];
+    await db.save(gid);
+    await reply(L(`✅ <@${target.id}> retiré de la liste noire.`, `✅ <@${target.id}> removed from the blacklist.`));
+    return;
+  }
+
+  if (cmd === 'stats') {
+    const nowTs = Date.now();
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(L('📊 Statistiques', '📊 Statistics'))
+      .addFields(
+        { name: L('Produits', 'Products'), value: `${Object.keys(g.products).length}`, inline: true },
+        { name: L('Clés générées', 'Keys generated'), value: `${g.keys.length}`, inline: true },
+        { name: L('Clés utilisées', 'Keys used'), value: `${g.keys.filter((k) => k.redeemedAt).length}`, inline: true },
+        { name: 'Blacklist', value: `${Object.keys(g.blacklist).length}`, inline: true },
+        { name: L('Clés expirées', 'Expired keys'), value: `${g.keys.filter((k) => k.expiresAt && k.expiresAt < nowTs).length}`, inline: true },
+        { name: L('Clés verrouillées HWID', 'HWID-locked keys'), value: `${g.keys.filter((k) => k.hwid).length}`, inline: true },
+        { name: L('Lancements du script', 'Script launches'), value: `${g.keys.reduce((n, k) => n + (k.useCount || 0), 0)}`, inline: true },
+      );
+    for (const [id, p] of Object.entries(g.products).slice(0, 12)) {
+      embed.addFields({ name: p.name, value: L(`${issuedCountForProduct(g, id)} clé(s)`, `${issuedCountForProduct(g, id)} key(s)`), inline: false });
+    }
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (cmd === 'setcolor') {
+    const raw = interaction.options.getString('couleur').trim().replace('#', '');
+    if (!/^[0-9A-Fa-f]{6}$/.test(raw)) { await reply(L('❌ Format invalide. Exemple : #ff0000', '❌ Invalid format. Example: #ff0000')); return; }
+    g.config.panelColor = parseInt(raw, 16);
+    await db.save(gid);
+    await reply(L(`✅ Couleur du panel changée en #${raw}.`, `✅ Panel color changed to #${raw}.`));
+    await offerPanelUpdate(interaction, g);
+    return;
+  }
+
+  if (cmd === 'settitle' || cmd === 'setdescription' || cmd === 'setfooter') {
+    const map = {
+      settitle: ['panelTitle', 'titre', L('✅ Titre du panel mis à jour.', '✅ Panel title updated.')],
+      setdescription: ['panelDescription', 'texte', L('✅ Description du panel mise à jour.', '✅ Panel description updated.')],
+      setfooter: ['panelFooter', 'texte', L('✅ Pied de page du panel mis à jour.', '✅ Panel footer updated.')],
+    };
+    const [field, opt, msg] = map[cmd];
+    g.config[field] = interaction.options.getString(opt);
+    await db.save(gid);
+    await reply(msg);
+    await offerPanelUpdate(interaction, g);
+    return;
+  }
+
+  if (cmd === 'language') {
+    const langChoice = interaction.options.getString('langue');
+    g.config.language = langChoice;
+    await db.save(gid);
+    const M = mk(langChoice);
+    const note = ['es', 'pt', 'de'].includes(langChoice) ? M(" (traduction pas encore faite, affichera l'anglais)", ' (translation not done yet, English will be shown)') : '';
+    await reply(M(`✅ Langue : ${langChoice}${note}.`, `✅ Language: ${langChoice}${note}.`));
+    await offerPanelUpdate(interaction, g);
+    return;
+  }
+
+  if (cmd === 'setemoji') {
+    const btn = interaction.options.getString('bouton');
+    const emoji = interaction.options.getString('emoji');
+    g.config.buttonEmojis = { ...g.config.buttonEmojis, [btn]: emoji };
+    await db.save(gid);
+    await reply(L(`✅ Emoji mis à jour pour ce bouton : ${emoji}`, `✅ Emoji updated for this button: ${emoji}`));
+    await offerPanelUpdate(interaction, g);
+    return;
+  }
+}
+
+// ----------------------------------------------------------------
+// PANEL : quels produits sont sur CE panel (selon le message cliqué)
+// ----------------------------------------------------------------
+function panelProductIds(g, interaction) {
+  const record = interaction.message ? g.panels.find((p) => p.messageId === interaction.message.id) : null;
+  const ids = record ? record.productIds : Object.keys(g.products);
+  return new Set(ids.filter((id) => g.products[id]));
+}
+
+const noPermMsg = (L) => L(
+  "❌ Tu n'as pas la permission d'utiliser cette commande. Demande au propriétaire du serveur (`/permissions`).",
+  "❌ You don't have permission to use this. Ask the server owner (`/permissions`).",
+);
+
+// ----------------------------------------------------------------
+// BOUTONS
+// ----------------------------------------------------------------
+async function handleButton(interaction, guild, g) {
+  const gid = guild.id;
+  const uid = interaction.user.id;
+  const lang = g.config.language;
+  const L = mk(lang);
+  const id = interaction.customId;
+
+  // ---- Boutons d'administration (brouillon de panel, mise à jour) ----
+  if (id.startsWith('panel_') || id.startsWith('panelupdate_')) {
+    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), ephemeral: true }); return; }
+
+    if (id === 'panel_add_product') {
+      const modal = new ModalBuilder().setCustomId('modal_quick_addproduct').setTitle(L('Ajouter un produit', 'Add a product'));
+      const nameInput = new TextInputBuilder().setCustomId('q_name').setLabel(L('Nom du produit', 'Product name')).setStyle(TextInputStyle.Short).setRequired(true);
+      const stockInput = new TextInputBuilder().setCustomId('q_stock').setLabel(L('Stock max (0 = illimité)', 'Max stock (0 = unlimited)')).setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('0');
+      const expireInput = new TextInputBuilder().setCustomId('q_expire').setLabel(L('Expiration en jours (0 = jamais)', 'Expiry in days (0 = never)')).setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('0');
+      const scriptInput = new TextInputBuilder().setCustomId('q_script').setLabel(L('Lien Pastebin/Pastefy (raw) ou code', 'Pastebin/Pastefy (raw) link or code')).setStyle(TextInputStyle.Paragraph).setRequired(true);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(nameInput),
+        new ActionRowBuilder().addComponents(stockInput),
+        new ActionRowBuilder().addComponents(expireInput),
+        new ActionRowBuilder().addComponents(scriptInput),
+      );
+      await interaction.showModal(modal);
       return;
     }
 
-    const isAdmin = interaction.user.id === process.env.OWNER_ID;
-
-    // --- Slash commands ---
-    if (interaction.isChatInputCommand()) {
-      const cmd = interaction.commandName;
-
-      if (cmd === 'panel') {
-        await interaction.deferReply();
-        const sentMessage = await interaction.editReply({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
-        await trackPanel(sentMessage);
-
-        if (isAdmin) {
-          const config = loadConfig();
-          const buttonOptions = [
-            { label: 'Obtenir mes clés', value: 'key_get' },
-            { label: 'View Script', value: 'view_script' },
-            { label: 'Key Info', value: 'key_info' },
-            { label: 'Get Buyer Role', value: 'get_buyer_role' },
-            { label: 'Reset HWID', value: 'reset_hwid' },
-          ].map((o) => ({ ...o, default: config.panelButtons.includes(o.value) }));
-          const buttonSelect = new StringSelectMenuBuilder()
-            .setCustomId('select_panel_buttons')
-            .setPlaceholder('Choisis les boutons optionnels à afficher')
-            .setMinValues(0)
-            .setMaxValues(buttonOptions.length)
-            .addOptions(buttonOptions);
-          const addProductBtn = new ButtonBuilder().setCustomId('panel_setup_addproduct').setLabel('+ Ajouter un produit').setEmoji('📦').setStyle(ButtonStyle.Primary);
-          await interaction.followUp({
-            content: 'Configuration rapide du panel (facultatif) : choisis les boutons à afficher, et/ou ajoute un produit directement ici.',
-            components: [new ActionRowBuilder().addComponents(buttonSelect), new ActionRowBuilder().addComponents(addProductBtn)],
-            ephemeral: true,
-          });
-        }
-        return;
-      }
-
-      if (cmd === 'listproducts') {
-        await interaction.deferReply({ ephemeral: true });
-        const products = loadProducts();
-        const keys = loadKeys();
-        const entries = Object.entries(products);
-        if (entries.length === 0) { await interaction.editReply({ content: 'Aucun produit configuré.' }); return; }
-        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle('📦 Produits');
-        for (const [id, p] of entries) {
-          const issued = issuedCountForProduct(keys, id);
-          const stockStr = p.stock && p.stock > 0  ? `${issued}/${p.stock}` : `${issued}/∞`;
-          const expStr = p.expireDays && p.expireDays > 0  ? `${p.expireDays}j` : 'jamais';
-          embed.addFields({ name: `${p.name} (${id})${p.killswitch ? ' 🔒' : ''}`, value: `Stock: ${stockStr} | Expiration: ${expStr}` });
-        }
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (cmd === 'help') {
-        await interaction.deferReply({ ephemeral: true });
-        const config = loadConfig();
-        const lang = config.language;
-        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(t(lang, 'help_title'));
-        embed.addFields({
-          name: t(lang, 'help_user_section'),
-          value: '`/panel` — affiche le panneau\n`/help` — cette aide',
-        });
-        if (isAdmin) {
-          embed.addFields({
-            name: t(lang, 'help_admin_section'),
-            value: [
-              '**Produits** : `/addproduct` `/listproducts` `/removeproduct` `/setrole`',
-              '**Clés** : `/genkey` `/whitelist` `/bulkgen` `/revokekey` `/deletekey` `/deleteuserkeys` `/lookupkey` `/lookupuser`',
-              '**Sécurité** : `/resetkeyhwid` `/sethwidcooldown` `/killswitch` `/blacklist` `/unblacklist`',
-              '**Apparence** : `/setcolor` `/settitle` `/setdescription` `/setfooter` `/setemoji` (boutons et produit se configurent via `/panel`)',
-              '**Autre** : `/language` `/stats`',
-              '**Multi-serveurs (toi uniquement, partout)** : `/ownerinfo` `/disableguild` `/enableguild`',
-            ].join('\n'),
-          });
-        }
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (cmd === 'ownerinfo') {
-        await interaction.deferReply({ ephemeral: true });
-        if (interaction.user.id !== process.env.OWNER_ID) {
-          await interaction.editReply({ content: '❌ Cette commande est réservée au propriétaire du bot.' });
-          return;
-        }
-        const guilds = [...client.guilds.cache.values()];
-        const disabledGuilds = loadConfig().disabledGuildIds || [];
-        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(`📡 Ton bot est utilisé dans ${guilds.length} serveur(s)`);
-        for (const g of guilds.slice(0, 25)) {
-          const status = disabledGuilds.includes(g.id) ? ' 🔴 désactivé' : '';
-          embed.addFields({ name: `${g.name}${status}`, value: `ID: ${g.id} | Membres: ${g.memberCount}`, inline: false });
-        }
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (cmd === 'disableguild' || cmd === 'enableguild') {
-        await interaction.deferReply({ ephemeral: true });
-        if (interaction.user.id !== process.env.OWNER_ID) {
-          await interaction.editReply({ content: '❌ Cette commande est réservée au propriétaire du bot.' });
-          return;
-        }
-        const guildId = interaction.options.getString('guild_id').trim();
-        const targetGuild = client.guilds.cache.get(guildId);
-        if (!targetGuild) { await interaction.editReply({ content: "❌ Le bot n'est pas dans un serveur avec cet ID." }); return; }
-
-        const config = loadConfig();
-        const disabledGuilds = new Set(config.disabledGuildIds || []);
-        if (cmd === 'disableguild') disabledGuilds.add(guildId);
-        else disabledGuilds.delete(guildId);
-        config.disabledGuildIds = [...disabledGuilds];
-        await saveConfig(config);
-
-        await interaction.editReply({
-          content: cmd === 'disableguild'
-            ? `🔴 Bot désactivé sur **${targetGuild.name}**.`
-            : `🟢 Bot réactivé sur **${targetGuild.name}**.`,
-        });
-        return;
-      }
-
-      if (!isAdmin) { await interaction.reply({ content: '❌ Réservé aux administrateurs.', ephemeral: true }); return; }
-
-      // /addproduct ouvre une fenêtre : doit être la toute première réponse
-      if (cmd === 'addproduct') {
-        const name = interaction.options.getString('nom');
-        const stock = interaction.options.getInteger('stock') || 0;
-        const expireDays = interaction.options.getInteger('expiration_jours') || 0;
-        const id = slugify(name);
-        pendingProducts.set(interaction.user.id, { id, name, stock, expireDays });
-        const modal = new ModalBuilder().setCustomId('modal_addproduct').setTitle(`Script pour ${name}`.slice(0, 45));
-        const scriptInput = new TextInputBuilder().setCustomId('script_content').setLabel('Lien Pastebin/Pastefy (raw) ou code').setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder('https://pastefy.app/xxxx/raw ou colle le code directement');
-        modal.addComponents(new ActionRowBuilder().addComponents(scriptInput));
-        await interaction.showModal(modal);
-        return;
-      }
-
-      await interaction.deferReply({ ephemeral: true });
-
-      if (cmd === 'removeproduct') {
-        const id = interaction.options.getString('produit');
-        const products = loadProducts();
-        if (!products[id]) { await interaction.editReply({ content: '❌ Produit introuvable.' }); return; }
-        delete products[id];
-        await saveProducts(products);
-        const roleMap = loadRoleMap();
-        for (const roleId of Object.keys(roleMap)) if (roleMap[roleId] === id) delete roleMap[roleId];
-        await saveRoleMap(roleMap);
-        await interaction.editReply({ content: '✅ Produit supprimé.' });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'setrole') {
-        const role = interaction.options.getRole('role');
-        const productId = interaction.options.getString('produit');
-        const products = loadProducts();
-        if (!products[productId]) { await interaction.editReply({ content: '❌ Produit introuvable.' }); return; }
-        const roleMap = loadRoleMap();
-        roleMap[role.id] = productId;
-        await saveRoleMap(roleMap);
-        await interaction.editReply({ content: `✅ <@&${role.id}> déclenche maintenant une clé pour **${products[productId].name}**.` });
-        return;
-      }
-
-      if (cmd === 'genkey') {
-        const target = interaction.options.getUser('utilisateur');
-        const productId = interaction.options.getString('produit');
-        const blacklist = loadBlacklist();
-        if (blacklist[target.id]) { await interaction.editReply({ content: '❌ Cet utilisateur est blacklist.' }); return; }
-        const result = await issueKeyForUser(target.id, productId, { bypassStock: true });
-        if (result.error) { await interaction.editReply({ content: `❌ ${result.error}` }); return; }
-        await interaction.editReply({ content: `✅ Clé pour <@${target.id}> : \`${result.key}\`` });
-        return;
-      }
-
-      if (cmd === 'whitelist') {
-        const target = interaction.options.getUser('utilisateur');
-        const productId = interaction.options.getString('produit');
-        const blacklist = loadBlacklist();
-        if (blacklist[target.id]) { await interaction.editReply({ content: '❌ Cet utilisateur est blacklist.' }); return; }
-        const roleMap = loadRoleMap();
-        const linkedRoleId = Object.entries(roleMap).find(([, pid]) => pid === productId)?.[0];
-        if (linkedRoleId) {
-          try {
-            const member = await interaction.guild.members.fetch(target.id);
-            if (member.roles.cache.has(linkedRoleId)) {
-              await interaction.editReply({ content: `ℹ️ <@${target.id}> a déjà ce rôle. Utilise \`/genkey\` pour forcer une nouvelle clé.` });
-              return;
-            }
-            await member.roles.add(linkedRoleId);
-            await interaction.editReply({ content: `✅ Rôle <@&${linkedRoleId}> donné à <@${target.id}> — sa clé sera générée et envoyée automatiquement.` });
-          } catch (e) {
-            await interaction.editReply({ content: "❌ Impossible d'ajouter le rôle (permission Gérer les rôles / hiérarchie)." });
-          }
-          return;
-        }
-        const result = await issueKeyForUser(target.id, productId, { bypassStock: true });
-        if (result.error) { await interaction.editReply({ content: `❌ ${result.error}` }); return; }
-        await interaction.editReply({ content: `✅ Clé pour <@${target.id}> : \`${result.key}\` (aucun rôle lié, clé attribuée directement).` });
-        return;
-      }
-
-      if (cmd === 'bulkgen') {
-        const productId = interaction.options.getString('produit');
-        const quantity = interaction.options.getInteger('quantite');
-        if (quantity < 1 || quantity > 100) { await interaction.editReply({ content: '❌ Quantité entre 1 et 100.' }); return; }
-        const result = await bulkGenerate(productId, quantity, { bypassStock: true });
-        if (result.error) { await interaction.editReply({ content: `❌ ${result.error}` }); return; }
-        await interaction.editReply({ content: `✅ ${quantity} clé(s) générée(s) :\n\`\`\`${result.keys.join('\n')}\`\`\`` });
-        return;
-      }
-
-      if (cmd === 'revokekey' || cmd === 'deletekey') {
-        const value = interaction.options.getString('cle').trim().toUpperCase();
-        const keys = loadKeys();
-        const idx = keys.findIndex((k) => k.key === value);
-        if (idx === -1) { await interaction.editReply({ content: '❌ Clé introuvable.' }); return; }
-        keys.splice(idx, 1);
-        await saveKeys(keys);
-        await interaction.editReply({ content: '✅ Clé supprimée.' });
-        return;
-      }
-
-      if (cmd === 'deleteuserkeys') {
-        const target = interaction.options.getUser('utilisateur');
-        const keys = loadKeys();
-        const remaining = keys.filter((k) => k.userId !== target.id);
-        const removedCount = keys.length - remaining.length;
-        await saveKeys(remaining);
-        await interaction.editReply({ content: `✅ ${removedCount} clé(s) supprimée(s) pour <@${target.id}>.` });
-        return;
-      }
-
-      if (cmd === 'lookupkey') {
-        const value = interaction.options.getString('cle').trim().toUpperCase();
-        const keys = loadKeys();
-        const record = findKeyByValue(keys, value);
-        if (!record) { await interaction.editReply({ content: '❌ Clé introuvable.' }); return; }
-        const products = loadProducts();
-        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(`🔎 ${record.key}`)
-          .addFields(
-            { name: 'Produit', value: products[record.productId]?.name || record.productId, inline: true },
-            { name: 'Propriétaire', value: record.userId ? `<@${record.userId}>` : 'Non réclamée', inline: true },
-            { name: 'HWID', value: record.hwid || 'Aucun', inline: true },
-            { name: 'Créée', value: fmtDate(record.createdAt), inline: true },
-            { name: 'Réclamée', value: fmtDate(record.claimedAt), inline: true },
-            { name: 'Expire', value: record.expiresAt ? fmtDate(record.expiresAt) : 'Jamais', inline: true },
-            { name: 'Utilisée', value: fmtDate(record.redeemedAt), inline: true },
-            { name: 'Lancements', value: `${record.useCount || 0}`, inline: true },
-            { name: 'Dernier lancement', value: fmtDate(record.lastUsedAt), inline: true }
-          );
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (cmd === 'lookupuser') {
-        const target = interaction.options.getUser('utilisateur');
-        const keys = loadKeys();
-        const userKeys = findKeysByUser(keys, target.id);
-        const blacklist = loadBlacklist();
-        if (userKeys.length === 0) { await interaction.editReply({ content: `${target.tag} n'a aucune clé.${blacklist[target.id] ? ' (Blacklist)' : ''}` }); return; }
-        const products = loadProducts();
-        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(`👤 Clés de ${target.tag}`);
-        for (const k of userKeys) {
-          embed.addFields({ name: products[k.productId]?.name || k.productId, value: `\`${k.key}\` — ${k.redeemedAt ? 'utilisée' : 'non utilisée'}` });
-        }
-        if (blacklist[target.id]) embed.setDescription(`⚠️ Blacklist : ${blacklist[target.id].reason}`);
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (cmd === 'resetkeyhwid') {
-        const value = interaction.options.getString('cle').trim().toUpperCase();
-        const keys = loadKeys();
-        const record = findKeyByValue(keys, value);
-        if (!record) { await interaction.editReply({ content: '❌ Clé introuvable.' }); return; }
-        record.hwid = null;
-        record.hwidResetAt = Date.now();
-        await saveKeys(keys);
-        await interaction.editReply({ content: `✅ HWID réinitialisé pour \`${record.key}\`.` });
-        return;
-      }
-
-      if (cmd === 'sethwidcooldown') {
-        const hours = interaction.options.getInteger('heures');
-        const config = loadConfig();
-        config.hwidCooldownHours = hours;
-        await saveConfig(config);
-        await interaction.editReply({ content: `✅ Délai de reset HWID : ${hours}h.` });
-        return;
-      }
-
-      if (cmd === 'killswitch') {
-        const productId = interaction.options.getString('produit');
-        const state = interaction.options.getString('etat') === 'on';
-        if (productId === 'tous') {
-          const config = loadConfig();
-          config.killswitchGlobal = state;
-          await saveConfig(config);
-          await interaction.editReply({ content: `✅ Killswitch global : ${state ? 'activé (tout bloqué)' : 'désactivé'}.` });
-          await offerPanelUpdate(interaction);
-          return;
-        }
-        const products = loadProducts();
-        if (!products[productId]) { await interaction.editReply({ content: '❌ Produit introuvable.' }); return; }
-        products[productId].killswitch = state;
-        await saveProducts(products);
-        await interaction.editReply({ content: `✅ ${products[productId].name} : ${state ? 'accès bloqué' : 'accès rétabli'}.` });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'blacklist') {
-        const target = interaction.options.getUser('utilisateur');
-        const reason = interaction.options.getString('raison') || 'Non spécifiée';
-        const blacklist = loadBlacklist();
-        blacklist[target.id] = { reason, bannedAt: Date.now() };
-        await saveBlacklist(blacklist);
-        await interaction.editReply({ content: `✅ <@${target.id}> blacklist. Raison : ${reason}` });
-        return;
-      }
-
-      if (cmd === 'unblacklist') {
-        const target = interaction.options.getUser('utilisateur');
-        const blacklist = loadBlacklist();
-        delete blacklist[target.id];
-        await saveBlacklist(blacklist);
-        await interaction.editReply({ content: `✅ <@${target.id}> retiré de la liste noire.` });
-        return;
-      }
-
-      if (cmd === 'stats') {
-        const products = loadProducts();
-        const keys = loadKeys();
-        const blacklist = loadBlacklist();
-        const totalRedeemed = keys.filter((k) => k.redeemedAt).length;
-        const nowTs = Date.now();
-        const totalExpired = keys.filter((k) => k.expiresAt && k.expiresAt < nowTs).length;
-        const totalLocked = keys.filter((k) => k.hwid).length;
-        const totalLaunches = keys.reduce((n, k) => n + (k.useCount || 0), 0);
-        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle('📊 Statistiques')
-          .addFields(
-            { name: 'Produits', value: `${Object.keys(products).length}`, inline: true },
-            { name: 'Clés générées', value: `${keys.length}`, inline: true },
-            { name: 'Clés utilisées', value: `${totalRedeemed}`, inline: true },
-            { name: 'Blacklist', value: `${Object.keys(blacklist).length}`, inline: true },
-            { name: 'Clés expirées', value: `${totalExpired}`, inline: true },
-            { name: 'Clés verrouillées HWID', value: `${totalLocked}`, inline: true },
-            { name: 'Lancements du script', value: `${totalLaunches}`, inline: true }
-          );
-        for (const [id, p] of Object.entries(products)) {
-          embed.addFields({ name: p.name, value: `${issuedCountForProduct(keys, id)} clé(s)`, inline: false });
-        }
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (cmd === 'setcolor') {
-        const raw = interaction.options.getString('couleur').trim().replace('#', '');
-        if (!/^[0-9A-Fa-f]{6}$/.test(raw)) { await interaction.editReply({ content: '❌ Format invalide. Exemple : #ff0000' }); return; }
-        const config = loadConfig();
-        config.panelColor = parseInt(raw, 16);
-        await saveConfig(config);
-        await interaction.editReply({ content: `✅ Couleur du panel changée en #${raw}.` });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'settitle') {
-        const config = loadConfig();
-        config.panelTitle = interaction.options.getString('titre');
-        await saveConfig(config);
-        await interaction.editReply({ content: '✅ Titre du panel mis à jour.' });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'setdescription') {
-        const config = loadConfig();
-        config.panelDescription = interaction.options.getString('texte');
-        await saveConfig(config);
-        await interaction.editReply({ content: '✅ Description du panel mise à jour.' });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'setfooter') {
-        const config = loadConfig();
-        config.panelFooter = interaction.options.getString('texte');
-        await saveConfig(config);
-        await interaction.editReply({ content: '✅ Pied de page du panel mis à jour.' });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'language') {
-        const langChoice = interaction.options.getString('langue');
-        const config = loadConfig();
-        config.language = langChoice;
-        await saveConfig(config);
-        const note = ['es', 'pt', 'de'].includes(langChoice) ? ' (traduction pas encore faite, affichera l\'anglais)' : '';
-        await interaction.editReply({ content: `✅ Langue des acheteurs : ${langChoice}${note}.` });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (cmd === 'setemoji') {
-        const btn = interaction.options.getString('bouton');
-        const emoji = interaction.options.getString('emoji');
-        const config = loadConfig();
-        config.buttonEmojis = { ...config.buttonEmojis, [btn]: emoji };
-        await saveConfig(config);
-        await interaction.editReply({ content: `✅ Emoji mis à jour pour ce bouton : ${emoji}` });
-        await offerPanelUpdate(interaction);
-        return;
-      }
+    if (id === 'panel_cancel') {
+      panelDrafts.delete(`${gid}:${uid}`);
+      await interaction.update({ content: L('❌ Panel annulé.', '❌ Panel cancelled.'), components: [] });
+      return;
     }
 
-    // --- Boutons ---
-    if (interaction.isButton()) {
-      const blacklist = loadBlacklist();
-      const config = loadConfig();
-      const lang = config.language;
-
-      // key_redeem doit ouvrir une fenêtre : réponse immédiate sans defer
-      if (interaction.customId === 'key_redeem') {
-        if (blacklist[interaction.user.id]) { await interaction.reply({ content: t(lang, 'msg_blacklisted'), ephemeral: true }); return; }
-        const modal = new ModalBuilder().setCustomId('modal_redeem').setTitle(t(lang, 'modal_redeem_title'));
-        const keyInput = new TextInputBuilder().setCustomId('key_value').setLabel(t(lang, 'modal_redeem_label')).setStyle(TextInputStyle.Short).setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(keyInput));
-        await interaction.showModal(modal);
+    if (id === 'panel_publish') {
+      const draft = getDraft(gid, uid);
+      if (!draft) { await interaction.update({ content: L('⌛ Session expirée, relance `/panel`.', '⌛ Session expired, run `/panel` again.'), components: [] }); return; }
+      const productIds = [...draft.productIds].filter((p) => g.products[p]);
+      if (draft.buttons.size === 0 || productIds.length === 0) { await interaction.update(renderPanelDraft(g, draft)); return; }
+      const panel = { buttons: PANEL_BUTTON_IDS.filter((b) => draft.buttons.has(b)), productIds };
+      try {
+        const channel = await client.channels.fetch(draft.channelId);
+        const message = await channel.send({ embeds: [buildPanelEmbed(g, panel)], components: buildPanelButtons(g, panel) });
+        await trackPanel(gid, g, message, panel);
+      } catch (e) {
+        console.error('Publication du panel impossible :', e.message);
+        await interaction.reply({ content: L("❌ Je n'ai pas pu envoyer le panel dans ce salon (permissions : voir le salon, envoyer des messages, intégrer des liens).", "❌ I couldn't post the panel in this channel (permissions: view channel, send messages, embed links)."), ephemeral: true });
         return;
       }
-
-      if (interaction.customId === 'reset_hwid') {
-        if (blacklist[interaction.user.id]) { await interaction.reply({ content: t(lang, 'msg_blacklisted'), ephemeral: true }); return; }
-        const modal = new ModalBuilder().setCustomId('modal_hwid_reset').setTitle(t(lang, 'modal_hwid_title'));
-        const keyInput = new TextInputBuilder().setCustomId('key_value').setLabel(t(lang, 'modal_hwid_label')).setStyle(TextInputStyle.Short).setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(keyInput));
-        await interaction.showModal(modal);
-        return;
-      }
-
-      if (interaction.customId === 'panel_setup_addproduct') {
-        if (interaction.user.id !== process.env.OWNER_ID) { await interaction.reply({ content: '❌ Réservé aux administrateurs.', ephemeral: true }); return; }
-        const modal = new ModalBuilder().setCustomId('modal_quick_addproduct').setTitle('Ajouter un produit');
-        const nameInput = new TextInputBuilder().setCustomId('q_name').setLabel('Nom du produit').setStyle(TextInputStyle.Short).setRequired(true);
-        const stockInput = new TextInputBuilder().setCustomId('q_stock').setLabel('Stock max (0 = illimité)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('0');
-        const expireInput = new TextInputBuilder().setCustomId('q_expire').setLabel('Expiration en jours (0 = jamais)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('0');
-        const scriptInput = new TextInputBuilder().setCustomId('q_script').setLabel('Lien Pastebin/Pastefy (raw) ou code').setStyle(TextInputStyle.Paragraph).setRequired(true);
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(nameInput),
-          new ActionRowBuilder().addComponents(stockInput),
-          new ActionRowBuilder().addComponents(expireInput),
-          new ActionRowBuilder().addComponents(scriptInput)
-        );
-        await interaction.showModal(modal);
-        return;
-      }
-
-      if (interaction.customId === 'key_get') {
-        await interaction.deferReply({ ephemeral: true });
-        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
-        const roleMap = loadRoleMap();
-        const member = interaction.member;
-        const products = loadProducts();
-        const lines = [];
-        for (const [roleId, productId] of Object.entries(roleMap)) {
-          if (!member.roles.cache.has(roleId)) continue;
-          const result = await issueKeyForUser(member.id, productId);
-          if (result.error) { lines.push(`❌ ${products[productId]?.name || productId} : ${result.error}`); continue; }
-          lines.push(`🔑 ${products[productId]?.name || productId} : \`${result.key}\``);
-        }
-        if (lines.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_product_access') }); return; }
-        const sent = await dmUser(interaction.user, `Tes clés :\n${lines.join('\n')}`);
-        await interaction.editReply({ content: sent ? t(lang, 'msg_keys_sent_dm') : t(lang, 'msg_dm_failed') });
-        return;
-      }
-
-      if (interaction.customId === 'view_script') {
-        await interaction.deferReply({ ephemeral: true });
-        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
-        const keys = loadKeys();
-        const owned = findKeysByUser(keys, interaction.user.id);
-        if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
-
-        if (owned.length === 1) {
-          const deliveryRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`deliver_dm_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(`deliver_here_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary)
-          );
-          await interaction.editReply({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
-          return;
-        }
-
-        const products = loadProducts();
-        const select = new StringSelectMenuBuilder().setCustomId('select_view_script').setPlaceholder(t(lang, 'select_product_placeholder'))
-          .addOptions(owned.slice(0, 25).map((k) => ({ label: products[k.productId]?.name || k.productId, value: k.key })));
-        await interaction.editReply({ components: [new ActionRowBuilder().addComponents(select)] });
-        return;
-      }
-
-      if (interaction.customId === 'key_info') {
-        await interaction.deferReply({ ephemeral: true });
-        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
-        const keys = loadKeys();
-        const owned = findKeysByUser(keys, interaction.user.id);
-        if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
-        const products = loadProducts();
-        const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(t(lang, 'key_info_title'));
-        for (const k of owned) {
-          embed.addFields({
-            name: products[k.productId]?.name || k.productId,
-            value: `HWID: ${k.hwid ? '✅' : '—'} | Expire: ${k.expiresAt ? fmtDate(k.expiresAt) : 'Jamais'} | ${k.redeemedAt ? 'Utilisée' : 'Non utilisée'} | Lancements: ${k.useCount || 0}`,
-          });
-        }
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (interaction.customId === 'get_buyer_role') {
-        await interaction.deferReply({ ephemeral: true });
-        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
-        const roleMap = loadRoleMap();
-        const entries = Object.entries(roleMap);
-        if (entries.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_role_configured') }); return; }
-
-        if (entries.length === 1) {
-          const [roleId] = entries[0];
-          if (interaction.member.roles.cache.has(roleId)) { await interaction.editReply({ content: t(lang, 'msg_role_already') }); return; }
-          await interaction.member.roles.add(roleId);
-          await interaction.editReply({ content: t(lang, 'msg_role_granted') });
-          return;
-        }
-
-        const products = loadProducts();
-        const select = new StringSelectMenuBuilder().setCustomId('select_buyer_role').setPlaceholder(t(lang, 'select_product_placeholder'))
-          .addOptions(entries.slice(0, 25).map(([roleId, productId]) => ({ label: products[productId]?.name || productId, value: roleId })));
-        await interaction.editReply({ components: [new ActionRowBuilder().addComponents(select)] });
-        return;
-      }
-
-      // deliver_dm_<clé> / deliver_here_<clé> : choix fait par l'acheteur
-      // après avoir validé sa clé dans le modal de redeem.
-      if (interaction.customId.startsWith('deliver_dm_') || interaction.customId.startsWith('deliver_here_')) {
-        await interaction.deferUpdate();
-        const viaDm = interaction.customId.startsWith('deliver_dm_');
-        const keyValue = interaction.customId.replace(viaDm ? 'deliver_dm_' : 'deliver_here_', '');
-
-        const keys = loadKeys();
-        const record = findKeyByValue(keys, keyValue);
-        const blacklistNow = loadBlacklist();
-
-        if (!record || record.userId !== interaction.user.id) { await interaction.editReply({ content: t(lang, 'msg_invalid_key'), components: [] }); return; }
-        if (blacklistNow[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted'), components: [] }); return; }
-
-        const products = loadProducts();
-        const product = products[record.productId];
-        if (!product) { await interaction.editReply({ content: t(lang, 'msg_no_script_configured'), components: [] }); return; }
-        if (config.killswitchGlobal || product.killswitch) { await interaction.editReply({ content: t(lang, 'msg_product_disabled'), components: [] }); return; }
-        if (record.expiresAt && Date.now() > record.expiresAt) { await interaction.editReply({ content: t(lang, 'msg_key_expired'), components: [] }); return; }
-
-        const loaderSnippet = buildHostedLoader(record, product);
-
-        if (viaDm) {
-          const sent = await dmUser(interaction.user, `\`\`\`lua\n${loaderSnippet}\n\`\`\``);
-          await interaction.editReply({ content: sent ? t(lang, 'msg_script_sent_dm') : t(lang, 'msg_dm_failed'), components: [] });
-        } else {
-          await interaction.editReply({ content: `\`\`\`lua\n${loaderSnippet}\n\`\`\``, components: [] });
-        }
-        return;
-      }
-
-      if (interaction.customId === 'panelupdate_latest') {
-        await interaction.deferUpdate();
-        const panels = loadPanels().sort((a, b) => b.createdAt - a.createdAt);
-        if (panels.length === 0) { await interaction.editReply({ content: '❌ Plus aucun panel trouvé.', components: [] }); return; }
-        const result = await updatePanelByRecord(panels[0]);
-        await interaction.editReply({
-          content: result.ok ? '✅ Panel le plus récent mis à jour.' : `❌ Échec : ${result.reason === 'gone' ? 'ce panel a été supprimé.' : result.reason}`,
-          components: [],
-        });
-        return;
-      }
-
-      if (interaction.customId === 'panelupdate_pick') {
-        const panels = loadPanels().sort((a, b) => b.createdAt - a.createdAt).slice(0, 25);
-        const options = [];
-        for (const p of panels) {
-          let label = `Salon ${p.channelId}`;
-          try {
-            const ch = await client.channels.fetch(p.channelId);
-            label = `#${ch.name}`;
-          } catch (e) { /* salon supprimé, on garde le label par défaut */ }
-          options.push({ label: label.slice(0, 90), description: new Date(p.createdAt).toLocaleString('fr-FR'), value: JSON.stringify({ messageId: p.messageId, channelId: p.channelId }) });
-        }
-        const select = new StringSelectMenuBuilder().setCustomId('select_panel_update').setPlaceholder('Choisis un panel').addOptions(options);
-        await interaction.update({ content: 'Choisis quel panel mettre à jour :', components: [new ActionRowBuilder().addComponents(select)] });
-        return;
-      }
-
-      if (interaction.customId === 'panelupdate_cancel') {
-        await interaction.update({ content: 'OK, rien n\'a été changé sur le(s) panel(s) existant(s).', components: [] });
-        return;
-      }
+      panelDrafts.delete(`${gid}:${uid}`);
+      await interaction.update({ content: L('✅ Panel publié dans ce salon.', '✅ Panel published in this channel.'), components: [] });
+      return;
     }
 
-    // --- Menus déroulants (choix d'un produit parmi plusieurs) ---
-    if (interaction.isStringSelectMenu()) {
-      const blacklist = loadBlacklist();
-      const config = loadConfig();
-      const lang = config.language;
-      if (blacklist[interaction.user.id]) { await interaction.update({ content: t(lang, 'msg_blacklisted'), components: [] }); return; }
-
-      if (interaction.customId === 'select_panel_buttons') {
-        if (interaction.user.id !== process.env.OWNER_ID) { await interaction.update({ content: '❌ Réservé aux administrateurs.', components: [] }); return; }
-        await interaction.deferUpdate();
-        const newConfig = loadConfig();
-        newConfig.panelButtons = interaction.values;
-        await saveConfig(newConfig);
-        await interaction.editReply({
-          content: `✅ Boutons optionnels : ${interaction.values.length ? interaction.values.join(', ') : 'aucun'}.`,
-          components: interaction.message.components,
-        });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (interaction.customId === 'select_view_script') {
-        const keyValue = interaction.values[0];
-        const deliveryRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`deliver_dm_${keyValue}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(`deliver_here_${keyValue}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary)
-        );
-        await interaction.update({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
-        return;
-      }
-
-      if (interaction.customId === 'select_buyer_role') {
-        const roleId = interaction.values[0];
-        if (interaction.member.roles.cache.has(roleId)) { await interaction.update({ content: t(lang, 'msg_role_already'), components: [] }); return; }
-        try {
-          await interaction.member.roles.add(roleId);
-          await interaction.update({ content: t(lang, 'msg_role_granted'), components: [] });
-        } catch (e) {
-          await interaction.update({ content: "❌ Impossible d'ajouter le rôle.", components: [] });
-        }
-        return;
-      }
-
-      if (interaction.customId === 'select_panel_update') {
-        await interaction.deferUpdate();
-        const record = JSON.parse(interaction.values[0]);
-        const result = await updatePanelByRecord(record);
-        await interaction.editReply({
-          content: result.ok ? '✅ Panel mis à jour.' : `❌ Échec : ${result.reason === 'gone' ? 'ce panel a été supprimé.' : result.reason}`,
-          components: [],
-        });
-        return;
-      }
+    if (id === 'panelupdate_latest') {
+      await interaction.deferUpdate();
+      const panels = [...g.panels].sort((a, b) => b.createdAt - a.createdAt);
+      if (panels.length === 0) { await interaction.editReply({ content: L('❌ Plus aucun panel trouvé.', '❌ No panel found anymore.'), components: [] }); return; }
+      const result = await updatePanelByRecord(gid, g, panels[0]);
+      await interaction.editReply({
+        content: result.ok ? L('✅ Panel le plus récent mis à jour.', '✅ Latest panel updated.') : `❌ ${result.reason === 'gone' ? L('Échec : ce panel a été supprimé.', 'Failed: this panel was deleted.') : result.reason}`,
+        components: [],
+      });
+      return;
     }
 
-    // --- Modals ---
-    if (interaction.isModalSubmit()) {
-      await interaction.deferReply({ ephemeral: true });
-      const config = loadConfig();
-      const lang = config.language;
-
-      if (interaction.customId === 'modal_addproduct') {
-        const pending = pendingProducts.get(interaction.user.id);
-        pendingProducts.delete(interaction.user.id);
-        if (!pending) { await interaction.editReply({ content: '❌ Session expirée, relance /addproduct.' }); return; }
-
-        try {
-          await createProductFromScriptInput({
-            id: pending.id, name: pending.name, stock: pending.stock, expireDays: pending.expireDays,
-            scriptInput: interaction.fields.getTextInputValue('script_content'),
-          });
-        } catch (e) {
-          await interaction.editReply({ content: `❌ Impossible de récupérer le lien (${e.message}). Vérifie que c'est bien un lien "raw".` });
-          return;
-        }
-        await interaction.editReply({ content: `✅ Produit **${pending.name}** créé (id: \`${pending.id}\`) — script obfusqué automatiquement (Moon Obf).` });
-        await offerPanelUpdate(interaction);
-        return;
+    if (id === 'panelupdate_pick') {
+      const panels = [...g.panels].sort((a, b) => b.createdAt - a.createdAt).slice(0, 25);
+      const options = [];
+      for (const p of panels) {
+        let label = `Salon ${p.channelId}`;
+        try { const ch = await client.channels.fetch(p.channelId); label = `#${ch.name}`; } catch (e) { /* salon supprimé */ }
+        options.push({ label: label.slice(0, 90), description: fmtDate(p.createdAt, lang), value: p.messageId });
       }
-
-      if (interaction.customId === 'modal_quick_addproduct') {
-        const name = interaction.fields.getTextInputValue('q_name').trim();
-        const stock = parseInt(interaction.fields.getTextInputValue('q_stock') || '0', 10) || 0;
-        const expireDays = parseInt(interaction.fields.getTextInputValue('q_expire') || '0', 10) || 0;
-        const id = slugify(name);
-
-        try {
-          await createProductFromScriptInput({ id, name, stock, expireDays, scriptInput: interaction.fields.getTextInputValue('q_script') });
-        } catch (e) {
-          await interaction.editReply({ content: `❌ Impossible de récupérer le lien (${e.message}). Vérifie que c'est bien un lien "raw".` });
-          return;
-        }
-        await interaction.editReply({ content: `✅ Produit **${name}** créé (id: \`${id}\`) — script obfusqué automatiquement (Moon Obf).` });
-        await offerPanelUpdate(interaction);
-        return;
-      }
-
-      if (interaction.customId === 'modal_hwid_reset') {
-        const inputKey = interaction.fields.getTextInputValue('key_value').trim().toUpperCase();
-        const keys = loadKeys();
-        const record = findKeyByValue(keys, inputKey);
-        if (!record || record.userId !== interaction.user.id) { await interaction.editReply({ content: t(lang, 'msg_no_hwid_key') }); return; }
-
-        const cooldownMs = (config.hwidCooldownHours || 0) * 3600000;
-        if (cooldownMs > 0 && record.hwidResetAt && Date.now() - record.hwidResetAt < cooldownMs) {
-          const remainingH = Math.ceil((cooldownMs - (Date.now() - record.hwidResetAt)) / 3600000);
-          await interaction.editReply({ content: t(lang, 'msg_hwid_cooldown', { hours: remainingH }) });
-          return;
-        }
-
-        record.hwid = null;
-        record.hwidResetAt = Date.now();
-        await saveKeys(keys);
-        await interaction.editReply({ content: t(lang, 'msg_hwid_reset_success') });
-        return;
-      }
-
-      if (interaction.customId === 'modal_redeem') {
-        const blacklist = loadBlacklist();
-        if (blacklist[interaction.user.id]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
-
-        const inputKey = interaction.fields.getTextInputValue('key_value').trim().toUpperCase();
-        const keys = loadKeys();
-        const record = findKeyByValue(keys, inputKey);
-
-        if (!record) { await interaction.editReply({ content: t(lang, 'msg_invalid_key') }); return; }
-        if (record.userId && record.userId !== interaction.user.id) { await interaction.editReply({ content: t(lang, 'msg_key_owned_by_other') }); return; }
-
-        const products = loadProducts();
-        const product = products[record.productId];
-        if (config.killswitchGlobal || product?.killswitch) { await interaction.editReply({ content: t(lang, 'msg_product_disabled') }); return; }
-
-        if (!record.userId) {
-          record.userId = interaction.user.id;
-          record.claimedAt = Date.now();
-          record.expiresAt = product?.expireDays && product.expireDays > 0  ? Date.now() + product.expireDays * 86400000 : null;
-        }
-
-        if (record.expiresAt && Date.now() > record.expiresAt) { await interaction.editReply({ content: t(lang, 'msg_key_expired') }); return; }
-        if (!product || !product.script) { await interaction.editReply({ content: t(lang, 'msg_no_script_configured') }); return; }
-
-        record.redeemedAt = record.redeemedAt || Date.now();
-        await saveKeys(keys);
-
-        const deliveryRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`deliver_dm_${record.key}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(`deliver_here_${record.key}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary)
-        );
-        await interaction.editReply({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
-        return;
-      }
+      const select = new StringSelectMenuBuilder().setCustomId('select_panel_update').setPlaceholder(L('Choisis un panel', 'Choose a panel')).addOptions(options);
+      await interaction.update({ content: L('Choisis quel panel mettre à jour :', 'Choose which panel to update:'), components: [new ActionRowBuilder().addComponents(select)] });
+      return;
     }
+
+    if (id === 'panelupdate_cancel') {
+      await interaction.update({ content: L("OK, rien n'a été changé sur le(s) panel(s) existant(s).", 'OK, nothing was changed on the existing panel(s).'), components: [] });
+      return;
+    }
+    return;
+  }
+
+  // ---- Boutons des membres (panel) ----
+  const blacklisted = !!g.blacklist[uid];
+  const pids = panelProductIds(g, interaction);
+
+  // key_redeem / reset_hwid ouvrent une fenêtre : réponse immédiate sans defer
+  if (id === 'key_redeem' || id === 'reset_hwid') {
+    if (blacklisted) { await interaction.reply({ content: t(lang, 'msg_blacklisted'), ephemeral: true }); return; }
+    const isRedeem = id === 'key_redeem';
+    const modal = new ModalBuilder().setCustomId(isRedeem ? 'modal_redeem' : 'modal_hwid_reset').setTitle(t(lang, isRedeem ? 'modal_redeem_title' : 'modal_hwid_title'));
+    const keyInput = new TextInputBuilder().setCustomId('key_value').setLabel(t(lang, isRedeem ? 'modal_redeem_label' : 'modal_hwid_label')).setStyle(TextInputStyle.Short).setRequired(true);
+    modal.addComponents(new ActionRowBuilder().addComponents(keyInput));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (id === 'key_get') {
+    await interaction.deferReply({ ephemeral: true });
+    if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+    const member = interaction.member;
+    const lines = [];
+    for (const [roleId, productId] of Object.entries(g.roleMap)) {
+      if (!pids.has(productId) || !member.roles.cache.has(roleId)) continue;
+      const result = await issueKeyForUser(gid, g, member.id, productId);
+      const name = g.products[productId]?.name || productId;
+      lines.push(result.error ? `❌ ${name} : ${result.error}` : `🔑 ${name} : \`${result.key}\``);
+    }
+    if (lines.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_product_access') }); return; }
+    const sent = await dmUser(interaction.user, `${t(lang, 'keys_dm_header')}\n${lines.join('\n')}`);
+    await interaction.editReply({ content: sent ? t(lang, 'msg_keys_sent_dm') : t(lang, 'msg_dm_failed') });
+    return;
+  }
+
+  if (id === 'view_script') {
+    await interaction.deferReply({ ephemeral: true });
+    if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+    const owned = findKeysByUser(g, uid).filter((k) => pids.has(k.productId));
+    if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
+    if (owned.length === 1) {
+      const deliveryRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`deliver_dm_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`deliver_here_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.editReply({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
+      return;
+    }
+    const select = new StringSelectMenuBuilder().setCustomId('select_view_script').setPlaceholder(t(lang, 'select_product_placeholder'))
+      .addOptions(owned.slice(0, 25).map((k) => ({ label: g.products[k.productId]?.name || k.productId, value: k.key })));
+    await interaction.editReply({ components: [new ActionRowBuilder().addComponents(select)] });
+    return;
+  }
+
+  if (id === 'key_info') {
+    await interaction.deferReply({ ephemeral: true });
+    if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+    const owned = findKeysByUser(g, uid).filter((k) => pids.has(k.productId));
+    if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(t(lang, 'key_info_title'));
+    for (const k of owned.slice(0, 25)) {
+      embed.addFields({
+        name: g.products[k.productId]?.name || k.productId,
+        value: t(lang, 'key_info_line', { hwid: k.hwid ? '✅' : '—', exp: k.expiresAt ? fmtDate(k.expiresAt, lang) : t(lang, 'word_never'), used: k.redeemedAt ? t(lang, 'word_used') : t(lang, 'word_unused'), n: k.useCount || 0 }),
+      });
+    }
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (id === 'get_buyer_role') {
+    await interaction.deferReply({ ephemeral: true });
+    if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+    const entries = Object.entries(g.roleMap).filter(([, productId]) => pids.has(productId));
+    if (entries.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_role_configured') }); return; }
+    if (entries.length === 1) {
+      const [roleId] = entries[0];
+      if (interaction.member.roles.cache.has(roleId)) { await interaction.editReply({ content: t(lang, 'msg_role_already') }); return; }
+      try {
+        await interaction.member.roles.add(roleId);
+        await interaction.editReply({ content: t(lang, 'msg_role_granted') });
+      } catch (e) { await interaction.editReply({ content: t(lang, 'msg_role_add_failed') }); }
+      return;
+    }
+    const select = new StringSelectMenuBuilder().setCustomId('select_buyer_role').setPlaceholder(t(lang, 'select_product_placeholder'))
+      .addOptions(entries.slice(0, 25).map(([roleId, productId]) => ({ label: g.products[productId]?.name || productId, value: roleId })));
+    await interaction.editReply({ components: [new ActionRowBuilder().addComponents(select)] });
+    return;
+  }
+
+  // deliver_dm_<clé> / deliver_here_<clé> : choix fait par l'acheteur
+  // après avoir validé sa clé.
+  if (id.startsWith('deliver_dm_') || id.startsWith('deliver_here_')) {
+    await interaction.deferUpdate();
+    const viaDm = id.startsWith('deliver_dm_');
+    const keyValue = id.replace(viaDm ? 'deliver_dm_' : 'deliver_here_', '');
+    const record = findKeyByValue(g, keyValue);
+
+    if (!record || record.userId !== uid) { await interaction.editReply({ content: t(lang, 'msg_invalid_key'), components: [] }); return; }
+    if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted'), components: [] }); return; }
+    const product = g.products[record.productId];
+    if (!product) { await interaction.editReply({ content: t(lang, 'msg_no_script_configured'), components: [] }); return; }
+    if (g.config.killswitchGlobal || product.killswitch) { await interaction.editReply({ content: t(lang, 'msg_product_disabled'), components: [] }); return; }
+    if (record.expiresAt && Date.now() > record.expiresAt) { await interaction.editReply({ content: t(lang, 'msg_key_expired'), components: [] }); return; }
+
+    const loaderSnippet = buildHostedLoader(record);
+    if (viaDm) {
+      const sent = await dmUser(interaction.user, `\`\`\`lua\n${loaderSnippet}\n\`\`\``);
+      await interaction.editReply({ content: sent ? t(lang, 'msg_script_sent_dm') : t(lang, 'msg_dm_failed'), components: [] });
+    } else {
+      await interaction.editReply({ content: `\`\`\`lua\n${loaderSnippet}\n\`\`\``, components: [] });
+    }
+    return;
+  }
+}
+
+// ----------------------------------------------------------------
+// MENUS DÉROULANTS
+// ----------------------------------------------------------------
+async function handleSelect(interaction, guild, g) {
+  const gid = guild.id;
+  const uid = interaction.user.id;
+  const lang = g.config.language;
+  const L = mk(lang);
+  const id = interaction.customId;
+
+  // ---- Admin : brouillon de panel / choix du panel à mettre à jour ----
+  if (id === 'panel_sel_buttons' || id === 'panel_sel_products' || id === 'select_panel_update') {
+    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), ephemeral: true }); return; }
+
+    if (id === 'select_panel_update') {
+      await interaction.deferUpdate();
+      const record = g.panels.find((p) => p.messageId === interaction.values[0]);
+      if (!record) { await interaction.editReply({ content: L('❌ Panel introuvable.', '❌ Panel not found.'), components: [] }); return; }
+      const result = await updatePanelByRecord(gid, g, record);
+      await interaction.editReply({
+        content: result.ok ? L('✅ Panel mis à jour.', '✅ Panel updated.') : `❌ ${result.reason === 'gone' ? L('Échec : ce panel a été supprimé.', 'Failed: this panel was deleted.') : result.reason}`,
+        components: [],
+      });
+      return;
+    }
+
+    const draft = getDraft(gid, uid);
+    if (!draft) { await interaction.update({ content: L('⌛ Session expirée, relance `/panel`.', '⌛ Session expired, run `/panel` again.'), components: [] }); return; }
+    if (id === 'panel_sel_buttons') draft.buttons = new Set(interaction.values.filter((v) => PANEL_BUTTON_IDS.includes(v)));
+    else draft.productIds = new Set(interaction.values.filter((v) => g.products[v]));
+    await interaction.update(renderPanelDraft(g, draft));
+    return;
+  }
+
+  // ---- Membres ----
+  if (g.blacklist[uid]) { await interaction.update({ content: t(lang, 'msg_blacklisted'), components: [] }); return; }
+
+  if (id === 'select_view_script') {
+    const keyValue = interaction.values[0];
+    const deliveryRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`deliver_dm_${keyValue}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`deliver_here_${keyValue}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary),
+    );
+    await interaction.update({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
+    return;
+  }
+
+  if (id === 'select_buyer_role') {
+    const roleId = interaction.values[0];
+    if (!g.roleMap[roleId]) { await interaction.update({ content: t(lang, 'msg_no_role_configured'), components: [] }); return; }
+    if (interaction.member.roles.cache.has(roleId)) { await interaction.update({ content: t(lang, 'msg_role_already'), components: [] }); return; }
+    try {
+      await interaction.member.roles.add(roleId);
+      await interaction.update({ content: t(lang, 'msg_role_granted'), components: [] });
+    } catch (e) {
+      await interaction.update({ content: t(lang, 'msg_role_add_failed'), components: [] });
+    }
+    return;
+  }
+}
+
+// ----------------------------------------------------------------
+// FENÊTRES (MODALS)
+// ----------------------------------------------------------------
+async function handleModal(interaction, guild, g) {
+  const gid = guild.id;
+  const uid = interaction.user.id;
+  const lang = g.config.language;
+  const L = mk(lang);
+  const id = interaction.customId;
+
+  // ---- Admin : ajout de produit ----
+  if (id === 'modal_addproduct' || id === 'modal_quick_addproduct') {
+    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), ephemeral: true }); return; }
+    const fromDraft = id === 'modal_quick_addproduct' && typeof interaction.isFromMessage === 'function' && interaction.isFromMessage();
+    if (fromDraft) await interaction.deferUpdate(); else await interaction.deferReply({ ephemeral: true });
+    const say = (content) => (fromDraft ? interaction.followUp({ content, ephemeral: true }) : interaction.editReply({ content }));
+
+    let info;
+    if (id === 'modal_addproduct') {
+      info = pendingProducts.get(`${gid}:${uid}`);
+      pendingProducts.delete(`${gid}:${uid}`);
+      if (!info) { await say(L('❌ Session expirée, relance /addproduct.', '❌ Session expired, run /addproduct again.')); return; }
+      info = { ...info, scriptInput: interaction.fields.getTextInputValue('script_content') };
+    } else {
+      const name = interaction.fields.getTextInputValue('q_name').trim();
+      info = {
+        id: slugify(name), name,
+        stock: parseInt(interaction.fields.getTextInputValue('q_stock') || '0', 10) || 0,
+        expireDays: parseInt(interaction.fields.getTextInputValue('q_expire') || '0', 10) || 0,
+        scriptInput: interaction.fields.getTextInputValue('q_script'),
+      };
+    }
+
+    try {
+      await createProductFromScriptInput(gid, g, info);
+    } catch (e) {
+      if (e.message === 'PRODUCT_EXISTS') await say(L('❌ Un produit avec ce nom existe déjà.', '❌ A product with this name already exists.'));
+      else await say(L(`❌ Impossible de récupérer le lien (${e.message}). Vérifie que c'est bien un lien "raw".`, `❌ Couldn't fetch the link (${e.message}). Make sure it's a "raw" link.`));
+      return;
+    }
+
+    const doneMsg = L(`✅ Produit **${info.name}** créé (id: \`${info.id}\`) — script obfusqué automatiquement (Moon Obf).`, `✅ Product **${info.name}** created (id: \`${info.id}\`) — script obfuscated automatically (Moon Obf).`);
+    if (fromDraft) {
+      const draft = getDraft(gid, uid);
+      if (draft) { draft.productIds.add(info.id); await interaction.editReply(renderPanelDraft(g, draft)); }
+      await interaction.followUp({ content: doneMsg, ephemeral: true });
+    } else {
+      await interaction.editReply({ content: doneMsg });
+      await offerPanelUpdate(interaction, g);
+    }
+    return;
+  }
+
+  // ---- Membres ----
+  await interaction.deferReply({ ephemeral: true });
+  const pids = panelProductIds(g, interaction);
+
+  if (id === 'modal_hwid_reset') {
+    const inputKey = interaction.fields.getTextInputValue('key_value').trim().toUpperCase();
+    const record = findKeyByValue(g, inputKey);
+    if (!record || record.userId !== uid || !pids.has(record.productId)) { await interaction.editReply({ content: t(lang, 'msg_no_hwid_key') }); return; }
+
+    const cooldownMs = (g.config.hwidCooldownHours || 0) * 3600000;
+    if (cooldownMs > 0 && record.hwidResetAt && Date.now() - record.hwidResetAt < cooldownMs) {
+      const remainingH = Math.ceil((cooldownMs - (Date.now() - record.hwidResetAt)) / 3600000);
+      await interaction.editReply({ content: t(lang, 'msg_hwid_cooldown', { hours: remainingH }) });
+      return;
+    }
+    record.hwid = null;
+    record.hwidResetAt = Date.now();
+    await db.save(gid);
+    await interaction.editReply({ content: t(lang, 'msg_hwid_reset_success') });
+    return;
+  }
+
+  if (id === 'modal_redeem') {
+    if (g.blacklist[uid]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
+
+    const inputKey = interaction.fields.getTextInputValue('key_value').trim().toUpperCase();
+    // La clé doit exister DANS CE SERVEUR (et sur les produits de ce panel).
+    const record = findKeyByValue(g, inputKey);
+    if (!record || !pids.has(record.productId)) { await interaction.editReply({ content: t(lang, 'msg_invalid_key') }); return; }
+    if (record.userId && record.userId !== uid) { await interaction.editReply({ content: t(lang, 'msg_key_owned_by_other') }); return; }
+
+    const product = g.products[record.productId];
+    if (g.config.killswitchGlobal || product?.killswitch) { await interaction.editReply({ content: t(lang, 'msg_product_disabled') }); return; }
+
+    if (!record.userId) {
+      record.userId = uid;
+      record.claimedAt = Date.now();
+      record.expiresAt = product?.expireDays && product.expireDays > 0 ? Date.now() + product.expireDays * 86400000 : null;
+    }
+    if (record.expiresAt && Date.now() > record.expiresAt) { await interaction.editReply({ content: t(lang, 'msg_key_expired') }); return; }
+    if (!product || !product.script) { await interaction.editReply({ content: t(lang, 'msg_no_script_configured') }); return; }
+
+    record.redeemedAt = record.redeemedAt || Date.now();
+    await db.save(gid);
+
+    const deliveryRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`deliver_dm_${record.key}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`deliver_here_${record.key}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary),
+    );
+    await interaction.editReply({ content: t(lang, 'msg_choose_delivery'), components: [deliveryRow] });
+  }
+}
+
+// ----------------------------------------------------------------
+// ROUTEUR D'INTERACTIONS
+// ----------------------------------------------------------------
+async function routeInteraction(interaction) {
+  const uid = interaction.user.id;
+  const botOwner = isBotOwner(uid);
+
+  // Serveur désactivé par toi : on bloque tout, sauf pour toi (OWNER_ID).
+  if (interaction.guildId && !botOwner && (db.getGlobal().disabledGuildIds || []).includes(interaction.guildId)) {
+    if (interaction.isAutocomplete()) { await interaction.respond([]).catch(() => {}); return; }
+    if (interaction.isRepliable()) await interaction.reply({ content: '❌ Ce bot est désactivé sur ce serveur. / This bot is disabled on this server.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  // Tes commandes à toi : marchent partout, sans /start.
+  if (interaction.isChatInputCommand() && OWNER_CMDS.has(interaction.commandName)) { await handleOwnerCommand(interaction); return; }
+
+  if (!interaction.guildId) {
+    if (interaction.isRepliable()) await interaction.reply({ content: 'Utilise cette commande dans un serveur. / Use this in a server.', ephemeral: true });
+    return;
+  }
+  const guild = interaction.guild || await client.guilds.fetch(interaction.guildId);
+  const g = db.get(guild.id);
+  const L = mk(g.config.language);
+
+  // /start et ses menus/boutons : la seule chose qui marche avant la config.
+  if (interaction.isChatInputCommand() && interaction.commandName === 'start') { await handleStartCommand(interaction, guild); return; }
+  if ((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('start_')) { await handleStartComponent(interaction, guild, g); return; }
+
+  // Tant que /start n'a pas été fait : plus rien ne marche.
+  if (!g.setupDone) {
+    if (interaction.isAutocomplete()) { await interaction.respond([]); return; }
+    await interaction.reply({ content: NOT_CONFIGURED_MSG, ephemeral: true });
+    return;
+  }
+
+  // Autocomplete produit
+  if (interaction.isAutocomplete()) {
+    if (!canManage(interaction, guild, g)) { await interaction.respond([]); return; }
+    const focused = interaction.options.getFocused().toLowerCase();
+    const choices = Object.entries(g.products)
+      .filter(([id, p]) => p.name.toLowerCase().includes(focused) || id.includes(focused))
+      .slice(0, 24)
+      .map(([id, p]) => ({ name: p.name, value: id }));
+    if (interaction.commandName === 'killswitch') choices.unshift({ name: L('Tous les produits', 'All products'), value: 'tous' });
+    await interaction.respond(choices.slice(0, 25));
+    return;
+  }
+
+  if (interaction.isChatInputCommand()) {
+    // /permissions : uniquement le propriétaire du serveur (ou toi).
+    if (interaction.commandName === 'permissions') {
+      if (!(botOwner || isGuildOwner(interaction, guild))) {
+        await interaction.reply({ content: L('❌ Seul le propriétaire du serveur peut gérer les permissions.', '❌ Only the server owner can manage permissions.'), ephemeral: true });
+        return;
+      }
+    } else if (!canManage(interaction, guild, g)) {
+      await interaction.reply({ content: noPermMsg(L), ephemeral: true });
+      return;
+    }
+    await handleChatCommand(interaction, guild, g);
+    return;
+  }
+  if (interaction.isButton()) { await handleButton(interaction, guild, g); return; }
+  if (interaction.isStringSelectMenu()) { await handleSelect(interaction, guild, g); return; }
+  if (interaction.isModalSubmit()) { await handleModal(interaction, guild, g); return; }
+}
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    await routeInteraction(interaction);
   } catch (err) {
     console.error('Erreur interaction :', err);
     if (interaction.isRepliable && interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: 'Une erreur est survenue.', ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: 'Une erreur est survenue. / An error occurred.', ephemeral: true }).catch(() => {});
     } else if (interaction.deferred) {
-      await interaction.editReply({ content: 'Une erreur est survenue.' }).catch(() => {});
+      await interaction.editReply({ content: 'Une erreur est survenue. / An error occurred.' }).catch(() => {});
     }
   }
 });
@@ -1346,7 +1534,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 (async () => {
   await db.initDb();
 
-  if (!process.env.DISCORD_TOKEN) console.error('❌ DISCORD_TOKEN manquant : ajoute-le dans les variables d\'environnement.');
+  if (!process.env.DISCORD_TOKEN) console.error("❌ DISCORD_TOKEN manquant : ajoute-le dans les variables d'environnement.");
   client.login(process.env.DISCORD_TOKEN).catch((e) => console.error('❌ Connexion Discord impossible :', e.message));
 
   // Lance aussi le petit serveur web (vérification HWID + scripts hébergés)

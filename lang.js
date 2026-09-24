@@ -1,6 +1,6 @@
 // Traductions pour les messages vus par les ACHETEURS (panel, boutons, DM).
-// Les commandes admin restent en français. es/pt/de recyclent l'anglais
-// pour l'instant (à traduire plus tard si besoin).
+// Les messages admin (commandes) sont traduits en français/anglais dans
+// index.js. es/pt/de recyclent l'anglais pour l'instant.
 
 const en = {
   btn_get_keys: 'Get my keys',
@@ -39,6 +39,18 @@ const en = {
   help_title: '📖 Help',
   help_user_section: 'Available to everyone',
   help_admin_section: 'Admin only',
+  panel_default_desc: 'Use the buttons below to get your keys or redeem one.',
+  panel_products_field: 'Available products',
+  panel_no_products: 'No product configured.',
+  tag_disabled: 'disabled',
+  keys_dm_header: 'Your keys:',
+  new_key_title: '🔑 New key generated',
+  new_key_desc: 'Product: **{product}**\n```{key}```\nUse the server panel to get the script.',
+  msg_role_add_failed: "❌ Couldn't add the role.",
+  key_info_line: 'HWID: {hwid} | Expires: {exp} | {used} | Launches: {n}',
+  word_never: 'Never',
+  word_used: 'Used',
+  word_unused: 'Unused',
 };
 
 const fr = {
@@ -78,6 +90,18 @@ const fr = {
   help_title: '📖 Aide',
   help_user_section: 'Accessible à tous',
   help_admin_section: 'Réservé aux admins',
+  panel_default_desc: 'Utilise les boutons pour récupérer tes clés ou en utiliser une.',
+  panel_products_field: 'Produits disponibles',
+  panel_no_products: 'Aucun produit configuré.',
+  tag_disabled: 'désactivé',
+  keys_dm_header: 'Tes clés :',
+  new_key_title: '🔑 Nouvelle clé générée',
+  new_key_desc: 'Produit : **{product}**\n```{key}```\nUtilise le panel du serveur pour recevoir le script.',
+  msg_role_add_failed: "❌ Impossible d'ajouter le rôle.",
+  key_info_line: 'HWID : {hwid} | Expire : {exp} | {used} | Lancements : {n}',
+  word_never: 'Jamais',
+  word_used: 'Utilisée',
+  word_unused: 'Non utilisée',
 };
 
 const STRINGS = { en, fr, es: en, pt: en, de: en };
