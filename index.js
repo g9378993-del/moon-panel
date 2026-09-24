@@ -79,6 +79,14 @@ function canManage(interaction, guild, g) {
   return g.allowedRoles.some((r) => roleIds.includes(r));
 }
 
+// Identifiant de CETTE copie du bot. Si /ownerinfo affiche des identifiants
+// différents d'une fois sur l'autre, le bot tourne à 2 endroits en même temps.
+const INSTANCE_ID = crypto.randomBytes(2).toString('hex');
+const STARTED_AT = Date.now();
+const dup = { count: 0, lastAt: null }; // "déjà répondu" = une autre copie du bot répond aussi
+// Permissions de l'invitation : voir/écrire/intégrer/historique/gérer les rôles.
+const INVITE_PERMS = '268520448';
+
 const NOT_CONFIGURED_MSG =
   "⚠️ Le bot n'est pas encore configuré sur ce serveur : le propriétaire doit lancer `/start`.\n" +
   "⚠️ The bot isn't set up on this server yet: the server owner must run `/start`.";
@@ -552,23 +560,65 @@ async function promptOwnerToStart(guild) {
   } catch (e) { /* DM fermés : pas grave, le message "pas configuré" guidera */ }
 }
 
+// MP au propriétaire du bot (toi) : ajout/retrait de serveur, alertes.
+async function notifyBotOwner(text) {
+  if (!process.env.OWNER_ID) return;
+  try { const u = await client.users.fetch(process.env.OWNER_ID); await u.send(text); }
+  catch (e) { console.error('MP au propriétaire du bot impossible :', e.message); }
+}
+
+// Journal PERSISTANT des serveurs : où le bot est ajouté, quand, et retiré.
+async function logGuild(type, guild) {
+  const glob = db.getGlobal();
+  glob.guildLog = glob.guildLog || [];
+  const open = glob.guildLog.find((e) => e.id === guild.id && !e.removedAt);
+  if (type === 'add' && !open) {
+    glob.guildLog.push({ id: guild.id, name: guild.name, ownerId: guild.ownerId || null, addedAt: guild.joinedTimestamp || Date.now(), removedAt: null });
+  } else if (type === 'remove' && open) {
+    open.removedAt = Date.now();
+    open.name = guild.name || open.name;
+  } else if (type === 'add' && open) {
+    open.name = guild.name; open.ownerId = guild.ownerId || open.ownerId;
+  }
+  glob.guildLog = glob.guildLog.slice(-100);
+  await db.saveGlobal();
+}
+
 client.once(Events.ClientReady, async () => {
-  console.log(`Connecté en tant que ${client.user.tag}`);
+  console.log(`Connecté en tant que ${client.user.tag} (instance ${INSTANCE_ID})`);
   console.log(`Serveurs actuels (${client.guilds.cache.size}) :`, [...client.guilds.cache.values()].map((g) => `${g.name} (${g.id})`).join(' | '));
   for (const guild of client.guilds.cache.values()) {
     const status = await syncGuildRecord(guild);
     if (status === 'reset') console.log(`♻️ Bot ré-ajouté à ${guild.name} : données remises à zéro.`);
+    await logGuild('add', guild);
+  }
+  // Serveurs où le bot a été retiré pendant qu'il était éteint.
+  for (const entry of (db.getGlobal().guildLog || [])) {
+    if (!entry.removedAt && !client.guilds.cache.has(entry.id)) await logGuild('remove', { id: entry.id, name: entry.name });
   }
   await registerCommands();
+
+  const st = db.getStatus();
+  if (!st.persistent) {
+    await notifyBotOwner(
+      "⚠️ **Ton bot tourne SANS stockage persistant.** Tout ce qui est créé (produits, clés...) sera PERDU au prochain redémarrage de Render.\n" +
+      `Raison : ${st.uriSet ? `connexion MongoDB échouée (${st.connectError || 'erreur inconnue'})` : 'la variable MONGODB_URI est absente sur Render'}.`
+    );
+  }
 });
 
 client.on(Events.GuildCreate, async (guild) => {
   const status = await syncGuildRecord(guild);
+  await logGuild('add', guild);
   console.log(`✅ Bot ajouté au serveur : ${guild.name} (${guild.id}) [${status}]`);
+  await notifyBotOwner(`➕ **Bot ajouté** au serveur **${guild.name}**\nID : \`${guild.id}\` · 👑 <@${guild.ownerId}> · 👥 ${guild.memberCount}`);
   if (status !== 'ok') await promptOwnerToStart(guild);
 });
-client.on(Events.GuildDelete, (guild) => {
+client.on(Events.GuildDelete, async (guild) => {
+  if (guild.available === false) return; // simple coupure Discord, le bot est toujours dedans
   console.log(`❌ Bot retiré d'un serveur : ${guild.name || guild.id}`);
+  await logGuild('remove', guild);
+  await notifyBotOwner(`➖ **Bot retiré** du serveur **${guild.name || guild.id}** (\`${guild.id}\`)`);
 });
 
 // ----------------------------------------------------------------
@@ -629,19 +679,51 @@ async function handleOwnerCommand(interaction) {
       return `**${r.name}**\nID : \`${r.id}\`\n👑 ${r.ownerId ? `<@${r.ownerId}>` : '?'} · 👥 ${r.members ?? '?'}\n${status}`;
     });
 
-    const pages = [];
+    // --- Bloc diagnostic : sur quelle copie du bot je parle, et le stockage.
+    const st = db.getStatus();
+    const invite = `https://discord.com/oauth2/authorize?client_id=${process.env.CLIENT_ID || client.user.id}&scope=bot%20applications.commands&permissions=${INVITE_PERMS}`;
+    const diag = [
+      `🤖 **${client.user.tag}** · app \`${process.env.CLIENT_ID || client.user.id}\``,
+      `🧩 Copie du bot \`${INSTANCE_ID}\` · démarrée <t:${Math.floor(STARTED_AT / 1000)}:R>`,
+      st.persistent
+        ? '💾 Stockage : ✅ MongoDB connecté (les données survivent aux redémarrages)'
+        : `💾 Stockage : ❌ **NON persistant** — ${st.uriSet ? `MongoDB inaccessible (${st.connectError || '?'})` : 'MONGODB_URI absent sur Render'}. Tout est perdu au redémarrage !`,
+      st.lastSaveError ? `⚠️ Dernière erreur d'écriture MongoDB : ${st.lastSaveError}` : null,
+      dup.count > 0
+        ? `🚨 **Le bot tourne à 2 endroits !** ${dup.count} fois, une autre copie a répondu avant celle-ci (dernière : <t:${Math.floor(dup.lastAt / 1000)}:R>). Arrête l'autre copie (Termux : \`pkill node\`, ou un 2e service Render).`
+        : '✅ Aucune autre copie du bot détectée.',
+      `➕ [Lien pour ajouter CE bot](${invite})`,
+    ].filter(Boolean).join('\n');
+
+    // --- Historique des ajouts / retraits (persistant).
+    const history = (db.getGlobal().guildLog || []).slice(-12).reverse().flatMap((e) => {
+      const out = [`➕ **${e.name}** (\`${e.id}\`) — ajouté <t:${Math.floor(e.addedAt / 1000)}:f>`];
+      if (e.removedAt) out.unshift(`➖ **${e.name}** (\`${e.id}\`) — retiré <t:${Math.floor(e.removedAt / 1000)}:f>`);
+      return out;
+    }).slice(0, 14).join('\n') || 'Aucun historique pour le moment.';
+
+    const embeds = [{ t: '🛠️ Diagnostic du bot', d: diag }];
     let cur = '';
-    for (const line of lines) {
-      if ((cur + '\n\n' + line).length > 3800) { pages.push(cur); cur = line; }
+    for (const line of lines.length ? lines : ['Aucun serveur.']) {
+      if ((cur + '\n\n' + line).length > 1800) { embeds.push({ t: '📡 Serveurs où le bot est ajouté', d: cur }); cur = line; }
       else cur = cur ? `${cur}\n\n${line}` : line;
     }
-    if (cur) pages.push(cur);
-    if (pages.length === 0) pages.push('Aucun serveur.');
+    if (cur) embeds.push({ t: `📡 Serveurs où le bot est ajouté (${list.length} au total)`, d: cur });
+    embeds.push({ t: '🕘 Historique des ajouts / retraits', d: history });
 
-    const title = `📡 Ton bot est dans ${list.length} serveur(s)`;
-    const mkEmbed = (text, i) => new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(i === 0 ? title : `${title} (suite)`).setDescription(text);
-    await interaction.editReply({ embeds: [mkEmbed(pages[0], 0)], allowedMentions: { parse: [] } });
-    for (let i = 1; i < pages.length; i++) await interaction.followUp({ embeds: [mkEmbed(pages[i], i)], ephemeral: true, allowedMentions: { parse: [] } });
+    // Regroupe en messages de moins de 5500 caractères (limite Discord : 6000).
+    const messages = [];
+    let group = []; let size = 0;
+    for (const e of embeds) {
+      const len = e.t.length + e.d.length;
+      if (group.length && (size + len > 5500 || group.length >= 10)) { messages.push(group); group = []; size = 0; }
+      group.push(new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(e.t).setDescription(e.d));
+      size += len;
+    }
+    if (group.length) messages.push(group);
+
+    await interaction.editReply({ embeds: messages[0], allowedMentions: { parse: [] } });
+    for (const m of messages.slice(1)) await interaction.followUp({ embeds: m, ephemeral: true, allowedMentions: { parse: [] } });
     return;
   }
 
@@ -825,7 +907,61 @@ async function handleChatCommand(interaction, guild, g) {
         L('**Autre** : `/language` `/stats`', '**Other**: `/language` `/stats`'),
       ].join('\n'),
     });
-    await interaction.editReply({ embeds: [embed] });
+    const tuto = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(L('📘 Tuto : créer ton panel', '📘 Tutorial: create your panel')).setDescription(L(
+      [
+        '**1️⃣ Configurer le bot** (une seule fois)',
+        "`/start` → choisis la langue puis la visibilité des réponses.",
+        '',
+        '**2️⃣ Ajouter un produit**',
+        "`/addproduct nom:MonScript` → colle un lien **raw** (Pastebin/Pastefy) ou ton code. Le bot l'obfusque tout seul.",
+        'Options : `stock` (nb max de clés), `expiration_jours`.',
+        '',
+        '**3️⃣ Lier un rôle (optionnel)**',
+        "`/setrole role:@Acheteur produit:MonScript` → quand un membre reçoit ce rôle, il reçoit sa clé en MP automatiquement.",
+        '',
+        '**4️⃣ Créer le panel**',
+        "`/panel` dans le salon voulu, puis :",
+        "• choisis les **boutons** : 🔑 Obtenir mes clés · 📥 Get Script (entrer sa clé) · 📜 Voir le script · 📊 Infos clé · 👤 Rôle acheteur · 🔄 Reset HWID",
+        "• choisis les **produits** (ou 📦 pour en ajouter un)",
+        "• clique **Publier** ✅",
+        '',
+        '**5️⃣ Donner accès à quelqu\'un**',
+        "`/whitelist utilisateur produit` (donne le rôle lié + la clé) ou `/genkey`. Pour des clés à vendre : `/bulkgen`.",
+        '',
+        '**6️⃣ Personnaliser**',
+        "`/settitle` `/setdescription` `/setcolor` `/setfooter` `/setemoji` → le bot propose de mettre à jour le panel déjà publié.",
+        '',
+        '**7️⃣ Donner accès à ton staff**',
+        "`/permissions add-role` ou `add-user` (owner du serveur uniquement).",
+      ].join('\n'),
+      [
+        '**1️⃣ Set up the bot** (once)',
+        '`/start` → pick the language, then reply visibility.',
+        '',
+        '**2️⃣ Add a product**',
+        "`/addproduct nom:MyScript` → paste a **raw** link (Pastebin/Pastefy) or your code. The bot obfuscates it automatically.",
+        'Options: `stock` (max keys), `expiration_jours`.',
+        '',
+        '**3️⃣ Link a role (optional)**',
+        "`/setrole role:@Buyer produit:MyScript` → when a member gets this role, they automatically receive their key by DM.",
+        '',
+        '**4️⃣ Create the panel**',
+        "`/panel` in the channel you want, then:",
+        "• choose the **buttons**: 🔑 Get my keys · 📥 Get Script (enter a key) · 📜 View script · 📊 Key info · 👤 Buyer role · 🔄 Reset HWID",
+        "• choose the **products** (or 📦 to add one)",
+        "• click **Publish** ✅",
+        '',
+        '**5️⃣ Give someone access**',
+        "`/whitelist utilisateur produit` (gives the linked role + key) or `/genkey`. To sell keys: `/bulkgen`.",
+        '',
+        '**6️⃣ Customize**',
+        "`/settitle` `/setdescription` `/setcolor` `/setfooter` `/setemoji` → the bot offers to update the already-published panel.",
+        '',
+        '**7️⃣ Give your staff access**',
+        "`/permissions add-role` or `add-user` (server owner only).",
+      ].join('\n'),
+    ));
+    await interaction.editReply({ embeds: [embed, tuto] });
     return;
   }
 
@@ -1385,7 +1521,8 @@ async function handleModal(interaction, guild, g) {
       return;
     }
 
-    const doneMsg = L(`✅ Produit **${info.name}** créé (id: \`${info.id}\`) — script obfusqué automatiquement (Moon Obf).`, `✅ Product **${info.name}** created (id: \`${info.id}\`) — script obfuscated automatically (Moon Obf).`);
+    const persistWarn = db.getStatus().persistent ? '' : L("\n⚠️ Le stockage du bot n'est pas persistant : ce produit sera perdu au prochain redémarrage. Préviens l'admin du bot (MongoDB).", '\n⚠️ The bot storage is not persistent: this product will be lost on the next restart. Tell the bot admin (MongoDB).');
+    const doneMsg = L(`✅ Produit **${info.name}** créé (id: \`${info.id}\`) — script obfusqué automatiquement (Moon Obf).`, `✅ Product **${info.name}** created (id: \`${info.id}\`) — script obfuscated automatically (Moon Obf).`) + persistWarn;
     if (fromDraft) {
       const draft = getDraft(gid, uid);
       if (draft) { draft.productIds.add(info.id); await interaction.editReply(renderPanelDraft(g, draft)); }
@@ -1522,6 +1659,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     await routeInteraction(interaction);
   } catch (err) {
+    if (err && err.code === 40060) {
+      // 40060 = "déjà répondu" : une AUTRE copie du bot a répondu avant nous.
+      dup.count++; dup.lastAt = Date.now();
+      console.warn('🚨 Une autre copie du bot répond aussi (Termux + Render ?). Arrête-en une !');
+      return;
+    }
     console.error('Erreur interaction :', err);
     if (interaction.isRepliable && interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: 'Une erreur est survenue. / An error occurred.', ephemeral: true }).catch(() => {});

@@ -26,7 +26,7 @@ const LEGACY = {
   panels: { file: 'panels.json', fallback: [] },
 };
 
-function defaultGlobal() { return { disabledGuildIds: [], legacyMigrated: false }; }
+function defaultGlobal() { return { disabledGuildIds: [], legacyMigrated: false, guildLog: [] }; }
 
 function defaultConfig() {
   return {
@@ -130,30 +130,54 @@ async function migrateLegacy(legacy) {
   await saveGlobal();
 }
 
+const status = { uriSet: false, mongoConnected: false, connectError: null, lastSaveError: null, lastSaveAt: null };
+
+async function connectMongo(uri) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const client = new MongoClient(uri, { serverSelectionTimeoutMS: 8000 });
+      await client.connect();
+      return client;
+    } catch (e) {
+      status.connectError = e.message;
+      console.error(`Connexion MongoDB échouée (essai ${attempt}/3) :`, e.message);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  return null;
+}
+
 async function initDb() {
   const uri = process.env.MONGODB_URI;
   let legacy = null;
+  status.uriSet = !!uri;
 
+  if (uri && !MongoClient) status.connectError = "le paquet 'mongodb' n'est pas installé";
   if (uri && MongoClient) {
-    try {
-      const client = new MongoClient(uri);
-      await client.connect();
-      collection = client.db('panelbot').collection('store');
-      const docs = await collection.find({}).toArray();
-      const legacyMongo = {};
-      for (const doc of docs) {
-        if (doc._id === 'global') state.global = { ...defaultGlobal(), ...doc.data };
-        else if (String(doc._id).startsWith('guild:')) state.guilds[String(doc._id).slice(6)] = normalizeGuild(doc.data);
-        else if (LEGACY[doc._id]) legacyMongo[doc._id] = doc.data;
+    const client = await connectMongo(uri);
+    if (client) {
+      try {
+        collection = client.db('panelbot').collection('store');
+        const docs = await collection.find({}).toArray();
+        const legacyMongo = {};
+        for (const doc of docs) {
+          if (doc._id === 'global') state.global = { ...defaultGlobal(), ...doc.data };
+          else if (String(doc._id).startsWith('guild:')) state.guilds[String(doc._id).slice(6)] = normalizeGuild(doc.data);
+          else if (LEGACY[doc._id]) legacyMongo[doc._id] = doc.data;
+        }
+        mongoReady = true;
+        status.mongoConnected = true;
+        status.connectError = null;
+        legacy = { ...readLegacyLocal(), ...legacyMongo };
+        console.log(`MongoDB connecté — données persistantes activées (${Object.keys(state.guilds).length} serveur(s) chargé(s)).`);
+      } catch (e) {
+        status.connectError = e.message;
+        console.error('Lecture MongoDB impossible :', e.message);
       }
-      mongoReady = true;
-      legacy = { ...readLegacyLocal(), ...legacyMongo };
-      console.log('MongoDB connecté — données persistantes activées.');
-    } catch (e) {
-      console.error('Connexion MongoDB échouée, on reste sur les fichiers locaux :', e.message);
     }
-  } else {
-    console.log('MongoDB non configuré : stockage local uniquement (non persistant entre déploiements Render).');
+    if (!mongoReady) console.error('⚠️ MongoDB inaccessible : le bot tourne SANS stockage persistant, les données seront perdues au redémarrage.');
+  } else if (!uri) {
+    console.log('MongoDB non configuré (MONGODB_URI absent) : stockage local uniquement, NON persistant sur Render.');
   }
 
   if (!mongoReady) { readLocalStore(); legacy = readLegacyLocal(); }
@@ -167,21 +191,29 @@ function get(guildId) {
   return state.guilds[guildId];
 }
 function all() { return state.guilds; }
+function getStatus() { return { ...status, persistent: mongoReady }; }
 function getGlobal() { return state.global; }
 
+async function mongoWrite(id, data) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await collection.updateOne({ _id: id }, { $set: { data } }, { upsert: true });
+      status.lastSaveError = null;
+      status.lastSaveAt = Date.now();
+      return;
+    } catch (e) {
+      status.lastSaveError = e.message;
+      console.error(`Erreur écriture MongoDB (essai ${attempt}/2) :`, e.message);
+    }
+  }
+}
 async function save(guildId) {
   writeLocalStore();
-  if (mongoReady && collection && state.guilds[guildId]) {
-    try { await collection.updateOne({ _id: `guild:${guildId}` }, { $set: { data: state.guilds[guildId] } }, { upsert: true }); }
-    catch (e) { console.error('Erreur écriture MongoDB :', e.message); }
-  }
+  if (mongoReady && collection && state.guilds[guildId]) await mongoWrite(`guild:${guildId}`, state.guilds[guildId]);
 }
 async function saveGlobal() {
   writeLocalStore();
-  if (mongoReady && collection) {
-    try { await collection.updateOne({ _id: 'global' }, { $set: { data: state.global } }, { upsert: true }); }
-    catch (e) { console.error('Erreur écriture MongoDB :', e.message); }
-  }
+  if (mongoReady && collection) await mongoWrite('global', state.global);
 }
 // Remet un serveur complètement à zéro (bot ré-ajouté).
 async function reset(guildId, botJoinedAt = null) {
@@ -189,4 +221,4 @@ async function reset(guildId, botJoinedAt = null) {
   await save(guildId);
 }
 
-module.exports = { initDb, peek, get, all, save, reset, getGlobal, saveGlobal };
+module.exports = { initDb, peek, get, all, save, reset, getGlobal, saveGlobal, getStatus };
