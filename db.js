@@ -133,15 +133,15 @@ async function migrateLegacy(legacy) {
 const status = { uriSet: false, mongoConnected: false, connectError: null, lastSaveError: null, lastSaveAt: null };
 
 async function connectMongo(uri) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const client = new MongoClient(uri, { serverSelectionTimeoutMS: 8000 });
+      const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
       await client.connect();
       return client;
     } catch (e) {
       status.connectError = e.message;
-      console.error(`Connexion MongoDB échouée (essai ${attempt}/3) :`, e.message);
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
+      console.error(`Connexion MongoDB échouée (essai ${attempt}/2) :`, e.message);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
     }
   }
   return null;

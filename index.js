@@ -32,6 +32,11 @@ process.on('uncaughtException', (err) => console.error('Exception non gérée :'
 
 const APP_CONFIG = { KEY_LENGTH: 16, EMBED_COLOR: 0x5865F2, BOT_NAME: 'Script Panel' };
 
+// Lancée tout de suite (voir tout en bas du fichier). Le bot attend cette
+// promesse avant de toucher aux données de db.js, mais elle ne bloque plus
+// le démarrage du serveur web ni la connexion à Discord.
+const dbReadyPromise = db.initDb();
+
 // Boutons que l'owner peut mettre (ou non) sur un panel.
 const PANEL_BUTTON_IDS = ['key_get', 'key_redeem', 'view_script', 'key_info', 'get_buyer_role', 'reset_hwid'];
 const BUTTON_DEFS = {
@@ -586,6 +591,10 @@ async function logGuild(type, guild) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Connecté en tant que ${client.user.tag} (instance ${INSTANCE_ID})`);
+  // Discord peut annoncer "ready" avant que MongoDB ait fini de charger : on
+  // attend, sinon on risque de traiter tous les serveurs comme "nouveaux"
+  // et de réinitialiser des serveurs déjà configurés.
+  await dbReadyPromise;
   console.log(`Serveurs actuels (${client.guilds.cache.size}) :`, [...client.guilds.cache.values()].map((g) => `${g.name} (${g.id})`).join(' | '));
   for (const guild of client.guilds.cache.values()) {
     const status = await syncGuildRecord(guild);
@@ -1657,6 +1666,7 @@ async function routeInteraction(interaction) {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    await dbReadyPromise; // ne jamais lire/écrire les données avant qu'elles soient chargées
     await routeInteraction(interaction);
   } catch (err) {
     if (err && err.code === 40060) {
@@ -1675,15 +1685,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 (async () => {
-  await db.initDb();
+  // 1) Le petit serveur web démarre EN PREMIER, avant tout le reste. C'est
+  // lui que Render surveille pour savoir si l'app est vivante : s'il tarde
+  // (à cause de MongoDB lent/indisponible), Render tue et redémarre l'app en
+  // boucle, ce qui coupe le bot Discord en permanence. Il doit donc être
+  // ouvert immédiatement, indépendamment de MongoDB.
+  require('./server');
 
   if (!process.env.DISCORD_TOKEN) console.error("❌ DISCORD_TOKEN manquant : ajoute-le dans les variables d'environnement.");
-  client.login(process.env.DISCORD_TOKEN).catch((e) => console.error('❌ Connexion Discord impossible :', e.message));
 
-  // Lance aussi le petit serveur web (vérification HWID + scripts hébergés)
-  // dans le même programme, pour qu'ils partagent les mêmes données et que
-  // l'hébergement (Render/Railway) reste tout-en-un.
-  require('./server');
+  // 2) Connexion à Discord ET à MongoDB EN MÊME TEMPS (pas l'une après
+  // l'autre) : si Mongo est lent, ça ne retarde plus la connexion Discord.
+  // dbReadyPromise est attendue par le handler "ready" (voir plus haut) avant
+  // de synchroniser les serveurs, pour ne jamais agir sur des données pas
+  // encore chargées.
+  client.login(process.env.DISCORD_TOKEN).catch((e) => console.error('❌ Connexion Discord impossible :', e.message));
+  await dbReadyPromise;
 
   // ----------------------------------------------------------------
   // ANTI-MISE EN VEILLE (plan gratuit Render)
