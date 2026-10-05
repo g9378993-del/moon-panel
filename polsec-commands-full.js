@@ -317,12 +317,7 @@ async function handlePolSecCommand(interaction, guild, g, {
       const scriptName = g.scripts[scriptId]?.name || scriptId;
       const channelName = interaction.channel?.name || 'unknown';
       
-      await reply({
-        embeds: [{
-          color: 0x00ff00,
-          description: `✅ <@${target.id}> whitelisted for **${scriptName}**\n→ Channel: #${channelName} | Status: Ready`
-        }]
-      });
+      await reply(`✅ <@${target.id}> whitelisted for **${scriptName}**\n→ Channel: #${channelName} | Status: Ready`);
       return;
     }
 
