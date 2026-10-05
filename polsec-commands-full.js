@@ -189,9 +189,9 @@ async function handlePolSecCommand(interaction, guild, g, {
     }
   };
 
-  // Defer with ephemeral for sensitive commands
+  // Defer with ephemeral for sensitive commands only
   if (!interaction.deferred) {
-    await interaction.deferReply({ ephemeral: SENSITIVE_CMDS.has(cmd) || true });
+    await interaction.deferReply({ ephemeral: SENSITIVE_CMDS.has(cmd) });
   }
 
   try {
@@ -317,7 +317,12 @@ async function handlePolSecCommand(interaction, guild, g, {
       const scriptName = g.scripts[scriptId]?.name || scriptId;
       const channelName = interaction.channel?.name || 'unknown';
       
-      await reply(`✅ <@${target.id}> whitelisted for **${scriptName}**\n→ Channel: #${channelName} | Status: Ready`);
+      const embed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setTitle('✅ Whitelisted')
+        .setDescription(`<@${target.id}> gained access to **${scriptName}**\n→ Channel: #${channelName} | Status: Ready`);
+      
+      await replyEmbed(embed);
       return;
     }
 
