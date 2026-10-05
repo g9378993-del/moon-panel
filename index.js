@@ -4,6 +4,7 @@ const https = require('https');
 const db = require('./db');
 const { t, SUPPORTED_LANGS } = require('./lang');
 const { obfuscateScript } = require('./obfuscate');
+const { buildPolsecCommands, handlePolSecCommand } = require('./polsec-commands-full');
 const {
   Client,
   GatewayIntentBits,
@@ -51,7 +52,11 @@ const BUTTON_DEFS = {
 // Commandes réservées à TOI (OWNER_ID), utilisables partout.
 const OWNER_CMDS = new Set(['ownerinfo', 'disableguild', 'enableguild']);
 // Commandes dont la réponse contient des clés / données perso : toujours privées.
-const SENSITIVE_CMDS = new Set(['genkey', 'whitelist', 'bulkgen', 'lookupkey', 'lookupuser', 'permissions']);
+const SENSITIVE_CMDS = new Set([
+  'genkey', 'whitelist', 'bulkgen', 'lookupkey', 'lookupuser', 'permissions',
+  'createscript', 'generatekey', 'deletekey', 'resetkeyhwid', 'blacklistuser',
+  'unblacklistuser', 'blacklisthwid', 'unblacklisthwid'
+]);
 
 // ----------------------------------------------------------------
 // OUTILS
@@ -498,6 +503,7 @@ const commands = [
         { name: 'Reset HWID', value: 'reset_hwid' },
       ))
     .addStringOption((o) => o.setName('emoji').setDescription('Le nouvel emoji, ex: 🔥').setRequired(true)),
+  ...buildPolsecCommands(),
 ].map((c) => c.setDMPermission(false).toJSON());
 
 // Commandes globales réservées à OWNER_ID (toi), utilisables partout.
@@ -1028,6 +1034,21 @@ async function handleChatCommand(interaction, guild, g) {
     const result = await issueKeyForUser(gid, g, target.id, productId, { bypassStock: true });
     if (result.error) { await reply(`❌ ${result.error}`); return; }
     await reply(L(`✅ Clé pour <@${target.id}> : \`${result.key}\` (aucun rôle lié, clé attribuée directement).`, `✅ Key for <@${target.id}>: \`${result.key}\` (no linked role, key assigned directly).`));
+    return;
+  }
+
+  // ====== PolSec Commands Router ======
+  const polsecCmdNames = new Set([
+    'createscript', 'generatekey', 'bulkgen', 'deletekey', 'whitelist',
+    'lookupkey', 'lookupuser', 'deleteuserkeys', 'resetkeyhwid',
+    'sethwidcooldown', 'blacklistuser', 'unblacklistuser', 'blacklisthwid',
+    'unblacklisthwid', 'killswitch', 'trial', 'compensate', 'scriptreminder',
+    'deletescript', 'linkscript', 'unlinkscript', 'setwebhook', 'setbuyerrole',
+    'exportkeys'
+  ]);
+
+  if (polsecCmdNames.has(cmd)) {
+    await handlePolSecCommand(interaction, guild, g, { db, APP_CONFIG, generateKeyString, t, mk, fmtDate, SENSITIVE_CMDS, canManage });
     return;
   }
 
