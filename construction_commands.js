@@ -1,281 +1,330 @@
-# Instructions : Push sur GitHub
+/**
+ * Construction Commands : gestion complète des salons
+ * - /buildmode : active/désactive le mode construction
+ * - /createchannel : crée un salon avec description, catégorie, permissions
+ * - /deletechannel : supprime un salon avec confirmation
+ * - /copychannels : copie les salons d'un autre serveur (ID requis)
+ */
 
-## 📋 Fichiers à avoir
+const {
+  SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType,
+} = require('discord.js');
 
-Assure-toi que tu as les 4 fichiers dans `/mnt/user-data/outputs/` :
-1. ✅ `construction_commands.js`
-2. ✅ `db.js`
-3. ✅ `index_patches.md`
-4. ✅ `README_CONSTRUCTION_COMMANDS.md`
+// Exporte les SlashCommandBuilder pour registration dans index.js
+const commands = [
+  new SlashCommandBuilder()
+    .setName('buildmode')
+    .setDescription('Active/désactive le mode construction du serveur')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
----
+  new SlashCommandBuilder()
+    .setName('createchannel')
+    .setDescription('Crée un nouveau salon')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .addStringOption((o) =>
+      o.setName('nom').setDescription('Nom du salon').setRequired(true)
+    )
+    .addStringOption((o) =>
+      o.setName('type').setDescription('Type de salon')
+        .setRequired(false)
+        .addChoices(
+          { name: 'Texte', value: 'text' },
+          { name: 'Vocal', value: 'voice' }
+        )
+    )
+    .addChannelOption((o) =>
+      o.setName('categorie').setDescription('Catégorie (optionnel)').setRequired(false)
+    )
+    .addStringOption((o) =>
+      o.setName('description').setDescription('Description (texte seulement)').setRequired(false)
+    ),
 
-## 🔧 Étapes d'intégration locale
+  new SlashCommandBuilder()
+    .setName('deletechannel')
+    .setDescription('Supprime un salon après confirmation')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .addChannelOption((o) =>
+      o.setName('salon').setDescription('Le salon à supprimer').setRequired(true)
+    ),
 
-### 1. Clone le repo (si pas déjà fait)
-```bash
-git clone <url-du-repo>
-cd <nom-du-repo>
-```
+  new SlashCommandBuilder()
+    .setName('copychannels')
+    .setDescription('Copie tous les salons d\'un autre serveur')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption((o) =>
+      o.setName('server_id').setDescription('ID du serveur à copier').setRequired(true)
+    )
+    .addBooleanOption((o) =>
+      o.setName('with_messages').setDescription('Copier aussi les permissions ? (true/false)').setRequired(false)
+    ),
+];
 
-### 2. Copie les fichiers
+// ============================================================
+// HANDLERS
+// ============================================================
 
-**Copie ces fichiers à la racine du bot :**
-```bash
-# Depuis ton dossier local du bot :
-cp <chemin>/construction_commands.js .
-cp <chemin>/db.js .
-```
+async function handleBuildMode(interaction, g, db) {
+  const newState = !g.constructionMode;
+  g.constructionMode = newState;
+  await db.save(interaction.guildId);
 
-**Copie les docs dans un dossier `docs/` :**
-```bash
-mkdir -p docs
-cp <chemin>/index_patches.md docs/
-cp <chemin>/README_CONSTRUCTION_COMMANDS.md docs/
-```
+  const embed = new EmbedBuilder()
+    .setColor(newState ? 0xFF9900 : 0x00AA00)
+    .setTitle(newState ? '🚧 Mode Construction ACTIVÉ' : '✅ Mode Construction DÉSACTIVÉ')
+    .setDescription(newState
+      ? 'Le serveur est maintenant en mode construction.\nLes membres ne pourront voir que les salons autorisés.'
+      : 'Le serveur est revenu à la normale.'
+    )
+    .setFooter({ text: `Changement appliqué par ${interaction.user.username}` });
 
-Résultat :
-```
-mon-bot/
-├── construction_commands.js      ← NOUVEAU
-├── db.js                          ← MODIFIÉ
-├── index.js                       ← À PATCHER
-├── ...autres fichiers...
-├── docs/
-│   ├── index_patches.md           ← DOCUMENTATION
-│   └── README_CONSTRUCTION_COMMANDS.md
-└── .gitignore
-```
+  await interaction.editReply({ embeds: [embed] });
+}
 
-### 3. Applique les patches dans `index.js`
+async function handleCreateChannel(interaction, client, g, db) {
+  const nom = interaction.options.getString('nom');
+  const typeStr = interaction.options.getString('type') || 'text';
+  const categorie = interaction.options.getChannel('categorie');
+  const description = interaction.options.getString('description');
 
-Ouvre `index.js` et applique les 4 patches de `docs/index_patches.md` :
+  const guild = interaction.guild;
+  const type = typeStr === 'voice' ? ChannelType.GuildVoice : ChannelType.GuildText;
 
-#### Patch 1 : Import (ligne ~15)
-Ajoute après `const perms = require('./perms');` :
-```javascript
-const constructionCmds = require('./construction_commands');
-```
+  try {
+    const channelData = {
+      name: nom.toLowerCase().replace(/[^a-z0-9-_]/g, '-').slice(0, 100),
+      type,
+      parent: categorie?.id || null,
+    };
 
-#### Patch 2 : Commands (ligne ~440)
-Remplace :
-```javascript
-commands.push(...economy.commands, ...perms.commands, ...trade.commands, ...bf.commands);
-```
-Par :
-```javascript
-commands.push(...economy.commands, ...perms.commands, ...constructionCmds.commands, ...trade.commands, ...bf.commands);
-```
-
-#### Patch 3 : Router (avant ligne ~1195)
-Ajoute avant `if (interaction.commandName === 'ask') {` :
-```javascript
-  if (constructionCmds.isConstructionCommand(interaction.commandName)) {
-    if (!perms.canUseCommand(interaction.member, g, interaction.commandName)) {
-      await interaction.reply({ content: "❌ Tu n'as pas la permission d'utiliser cette commande (Administrateur, Gérer le serveur, ou un rôle autorisé via `/staffrole`).", ephemeral: true });
-      return;
+    if (type === ChannelType.GuildText && description) {
+      channelData.topic = description.slice(0, 1024);
     }
-    await interaction.deferReply({ ephemeral: ['buildmode', 'copychannels'].includes(interaction.commandName) });
-    await constructionCmds.handleCommand(interaction, client, g, db);
+
+    const channel = await guild.channels.create(channelData);
+
+    const embed = new EmbedBuilder()
+      .setColor(0x00AA00)
+      .setTitle('✅ Salon créé')
+      .setDescription(`<#${channel.id}> a été créé.`)
+      .addFields(
+        { name: 'Nom', value: channel.name, inline: true },
+        { name: 'Type', value: type === ChannelType.GuildVoice ? 'Vocal 🎤' : 'Texte 💬', inline: true },
+        ...(categorie ? [{ name: 'Catégorie', value: categorie.name, inline: true }] : []),
+        ...(description ? [{ name: 'Description', value: description, inline: false }] : [])
+      )
+      .setFooter({ text: `Créé par ${interaction.user.username}` });
+
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err) {
+    await interaction.editReply(`❌ Erreur lors de la création : ${err.message}`);
+  }
+}
+
+async function handleDeleteChannel(interaction, g, db) {
+  const channel = interaction.options.getChannel('salon');
+
+  if (!channel) {
+    await interaction.editReply('❌ Salon introuvable.');
     return;
   }
-```
 
-#### Patch 4 : Boutons (avant `catch` dans `routeSelect()`)
-Ajoute avant le bloc `} catch (err)` de `routeSelect()` :
-```javascript
-  // Confirmation de suppression de salon
-  if (interaction.customId.startsWith('delete_confirm_')) {
-    const channelId = interaction.customId.split('_')[2];
-    const channel = interaction.guild.channels.cache.get(channelId);
-    if (channel && channel.deletable) {
-      await channel.delete('Suppression confirmée par ' + interaction.user.tag).catch(() => {});
-      await interaction.update({ content: '✅ Salon supprimé.', embeds: [], components: [] });
-    } else {
-      await interaction.update({ content: '❌ Impossible de supprimer le salon.', embeds: [], components: [] });
+  if (!channel.deletable) {
+    await interaction.editReply('❌ Je n\'ai pas la permission de supprimer ce salon.');
+    return;
+  }
+
+  // Confirmation via boutons
+  const confirmRow = new ActionRowBuilder()
+    .addComponents(
+      new ButtonBuilder()
+        .setCustomId(`delete_confirm_${channel.id}`)
+        .setLabel('✅ Confirmer la suppression')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`delete_cancel_${channel.id}`)
+        .setLabel('❌ Annuler')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFF0000)
+    .setTitle('⚠️ Êtes-vous sûr ?')
+    .setDescription(`Cette action va supprimer le salon <#${channel.id}> définitivement.\nCette action est irréversible.`)
+    .setFooter({ text: 'Vous avez 30 secondes pour confirmer.' });
+
+  await interaction.editReply({ embeds: [embed], components: [confirmRow] });
+
+  // Listener pour les boutons (à mettre dans routeSelect() d'index.js)
+  // Voir la section "Intégration" plus bas
+}
+
+async function handleCopyChannels(interaction, client, g, db) {
+  const serverId = interaction.options.getString('server_id');
+  const withPerms = interaction.options.getBoolean('with_messages') ?? true;
+
+  let sourceGuild;
+  try {
+    sourceGuild = await client.guilds.fetch(serverId);
+  } catch (err) {
+    await interaction.editReply(`❌ Serveur introuvable. Vérifie l'ID (je dois être sur ce serveur).`);
+    return;
+  }
+
+  if (!sourceGuild) {
+    await interaction.editReply(`❌ Je n'ai pas accès au serveur ${serverId}.`);
+    return;
+  }
+
+  const targetGuild = interaction.guild;
+  const channels = sourceGuild.channels.cache
+    .filter((c) => c.type === ChannelType.GuildText || c.type === ChannelType.GuildVoice)
+    .sort((a, b) => a.rawPosition - b.rawPosition);
+
+  if (channels.size === 0) {
+    await interaction.editReply(`❌ Aucun salon trouvé sur le serveur source.`);
+    return;
+  }
+
+  await interaction.editReply(`⏳ Copie en cours : ${channels.size} salon(s) à copier...`);
+
+  const results = { success: 0, failed: 0, errors: [] };
+  const categoryMap = {}; // sourceId -> targetId pour mapper les catégories
+
+  // Étape 1 : créer les catégories d'abord
+  for (const [id, channel] of channels) {
+    if (channel.type !== ChannelType.GuildCategory && channel.parent) {
+      if (!categoryMap[channel.parent.id]) {
+        try {
+          const newCategory = await targetGuild.channels.create({
+            name: channel.parent.name.toLowerCase().replace(/[^a-z0-9-_]/g, '-'),
+            type: ChannelType.GuildCategory,
+          });
+          categoryMap[channel.parent.id] = newCategory.id;
+        } catch (err) {
+          results.errors.push(`Catégorie "${channel.parent.name}": ${err.message}`);
+        }
+      }
     }
-    return;
   }
-  if (interaction.customId.startsWith('delete_cancel_')) {
-    await interaction.update({ content: '❌ Suppression annulée.', embeds: [], components: [] });
-    return;
+
+  // Étape 2 : créer les salons
+  for (const [id, sourceChannel] of channels) {
+    if (sourceChannel.type === ChannelType.GuildCategory) continue; // déjà fait
+
+    try {
+      const channelData = {
+        name: sourceChannel.name.toLowerCase().replace(/[^a-z0-9-_]/g, '-'),
+        type: sourceChannel.type,
+        parent: categoryMap[sourceChannel.parent?.id] || null,
+      };
+
+      if (sourceChannel.type === ChannelType.GuildText && sourceChannel.topic) {
+        channelData.topic = sourceChannel.topic;
+      }
+
+      // Copier les permissions si demandé
+      if (withPerms && sourceChannel.permissionOverwrites) {
+        const permissionOverwrites = [];
+        for (const [overrideId, override] of sourceChannel.permissionOverwrites.cache) {
+          // Exclure les roles de bots managés
+          const target = await sourceChannel.guild.members.fetch(overrideId).catch(() => null)
+            || sourceChannel.guild.roles.cache.get(overrideId);
+          
+          if (!target || (target.managed && target.roles)) continue; // skip rôles managés
+
+          // Essayer de trouver l'équivalent sur le serveur cible (par nom)
+          let targetId = overrideId;
+          if (override.type === 'role') {
+            const targetRole = targetGuild.roles.cache.find((r) => r.name === target.name);
+            if (targetRole) targetId = targetRole.id;
+            else continue; // rôle n'existe pas cible, skip
+          }
+
+          permissionOverwrites.push({
+            id: targetId,
+            type: override.type,
+            allow: override.allow,
+            deny: override.deny,
+          });
+        }
+        channelData.permissionOverwrites = permissionOverwrites;
+      }
+
+      const newChannel = await targetGuild.channels.create(channelData);
+      results.success++;
+    } catch (err) {
+      results.failed++;
+      results.errors.push(`"${sourceChannel.name}": ${err.message}`);
+    }
   }
-```
 
-### 4. Teste localement
-```bash
-npm install  # si dépendances manquent (normalement non)
-npm start
-```
+  // Résultat
+  const embed = new EmbedBuilder()
+    .setColor(results.failed === 0 ? 0x00AA00 : 0xFF9900)
+    .setTitle(`✅ Copie terminée : ${results.success}/${channels.size}`)
+    .setDescription(`Serveur source: **${sourceGuild.name}**\nServeur cible: **${targetGuild.name}**`)
+    .addFields(
+      { name: '✅ Réussis', value: String(results.success), inline: true },
+      { name: '❌ Échoués', value: String(results.failed), inline: true },
+      ...(results.errors.length > 0 ? [{ name: '⚠️ Erreurs', value: results.errors.slice(0, 5).join('\n').slice(0, 1024) }] : [])
+    )
+    .setFooter({ text: `Opération effectuée par ${interaction.user.username}` });
 
-Attends que le bot soit en ligne, puis teste les 4 commandes :
-```
-/buildmode
-/createchannel nom:test-salon
-/deletechannel salon:#test-salon
-/copychannels server_id:123...
-```
+  await interaction.editReply({ embeds: [embed] });
+}
 
-Tous les tests ✅ ? Passe à l'étape 5.
+// ============================================================
+// INTÉGRATION DANS INDEX.JS
+// ============================================================
+/*
+ * 1. Ajoute les commandes à la liste dans index.js (ligne ~316) :
+ *
+ * const constructionCmds = require('./construction_commands');
+ * const commands = [
+ *   ... commandes existantes ...
+ *   ...constructionCmds.commands
+ * ];
+ *
+ * 2. Dans handleModCommand() (ou routeInteraction si absent), ajoute :
+ *
+ * if (constructionCmds.isConstructionCommand(interaction.commandName)) {
+ *   await constructionCmds.handleCommand(interaction, client, g, db);
+ *   return;
+ * }
+ *
+ * 3. Dans routeSelect() pour les confirmations de suppression :
+ *
+ * if (interaction.customId.startsWith('delete_confirm_')) {
+ *   const channelId = interaction.customId.split('_')[2];
+ *   const channel = interaction.guild.channels.cache.get(channelId);
+ *   if (channel) await channel.delete('Suppression confirmée').catch(() => {});
+ *   await interaction.update({ content: '✅ Salon supprimé.', embeds: [], components: [] });
+ *   return;
+ * }
+ * if (interaction.customId.startsWith('delete_cancel_')) {
+ *   await interaction.update({ content: '❌ Annulé.', embeds: [], components: [] });
+ *   return;
+ * }
+ */
 
----
+function isConstructionCommand(cmdName) {
+  return ['buildmode', 'createchannel', 'deletechannel', 'copychannels'].includes(cmdName);
+}
 
-## 📤 Push sur GitHub
+async function handleCommand(interaction, client, g, db) {
+  const cmd = interaction.commandName;
 
-### 5. Git status
-```bash
-git status
-```
+  await interaction.deferReply({ ephemeral: ['buildmode', 'copychannels'].includes(cmd) });
 
-Tu devrais voir :
-```
-new file:   construction_commands.js
-modified:   db.js
-modified:   index.js
-new file:   docs/index_patches.md
-new file:   docs/README_CONSTRUCTION_COMMANDS.md
-```
+  if (cmd === 'buildmode') await handleBuildMode(interaction, g, db);
+  else if (cmd === 'createchannel') await handleCreateChannel(interaction, client, g, db);
+  else if (cmd === 'deletechannel') await handleDeleteChannel(interaction, g, db);
+  else if (cmd === 'copychannels') await handleCopyChannels(interaction, client, g, db);
+}
 
-### 6. Add files
-```bash
-git add construction_commands.js db.js index.js
-git add docs/
-```
-
-Ou tout en une :
-```bash
-git add .
-```
-
-Vérifies :
-```bash
-git status
-```
-
-Tous les fichiers doivent être en vert (staged).
-
-### 7. Commit
-```bash
-git commit -m "feat: add construction commands module (buildmode, createchannel, deletechannel, copychannels)"
-```
-
-**Bonne pratique** :
-- En français si ton repo est en français
-- Format : `feat:`, `fix:`, `docs:`, `refactor:`, etc.
-
-Alternative si tu veux plus de détails :
-```bash
-git commit -m "feat: add construction commands module
-
-- /buildmode: toggle server construction mode
-- /createchannel: create new channels (text/voice)
-- /deletechannel: delete channels with confirmation
-- /copychannels: copy all channels from another server
-
-Also updated db.js with new constructionMode flag."
-```
-
-### 8. Push
-```bash
-git push
-```
-
-Ou si tu es sur une branche :
-```bash
-git push origin <branch-name>
-```
-
-### 9. Vérifies sur GitHub
-
-Va sur https://github.com/ton-pseudo/ton-repo
-
-Clique sur "Commits" ou la branche — tu devrais voir ton commit.
-
----
-
-## ✅ Vérifications finales
-
-- [ ] `git push` sans erreur ✅
-- [ ] Commit visible sur GitHub ✅
-- [ ] Fichiers listés dans le commit ✅
-- [ ] `construction_commands.js` présent ✅
-- [ ] `db.js` modifié (constructionMode visible) ✅
-- [ ] `index.js` patché (4 sections modifiées) ✅
-- [ ] `docs/` contient les 2 fichiers ✅
-
----
-
-## 🚀 Après le push
-
-### Pour quelqu'un qui clone ton repo
-1. Clone le repo
-2. Copie les fichiers comme toi
-3. Applique les patches de `docs/index_patches.md`
-4. Redémarre le bot
-5. Les 4 commandes sont actives
-
-### Alternatives (si tu veux simplifier pour les autres)
-
-**Option 1** : Crée une branche `feature/construction-commands` au lieu de push sur `main`
-```bash
-git checkout -b feature/construction-commands
-git push origin feature/construction-commands
-```
-Puis crée une Pull Request sur GitHub.
-
-**Option 2** : Crée un script d'intégration automatique (plus complexe, pas couvert ici).
-
----
-
-## 🐛 Troubleshooting
-
-### "fatal: not a git repository"
-```bash
-git init
-git remote add origin <url-du-repo>
-git fetch
-git checkout main  # ou master
-```
-
-### "error: Your local changes to <file> would be overwritten by merge"
-```bash
-git stash  # sauvegarde tes changements
-git pull
-git stash pop  # restaure
-```
-
-### "Permission denied (publickey)"
-Ajoute ta clé SSH à GitHub :
-https://github.com/settings/keys
-
-Ou utilise HTTPS :
-```bash
-git remote set-url origin https://github.com/user/repo.git
-```
-
-### "conflict in index.js" au merge
-C'est normal si quelqu'un a modifié `index.js` en même temps.
-
-Résous manuellement (les 4 patches sont clairement marqués) :
-```bash
-# Ouvre index.js
-# Cherche les marques de conflit : <<<<, ====, >>>>
-# Garde tes changements et les nôtres
-git add index.js
-git commit -m "merge: resolve conflicts in index.js"
-git push
-```
-
----
-
-## 📚 Ressources Git
-
-- [Git documentation](https://git-scm.com/doc)
-- [GitHub Quick Start](https://docs.github.com/en/get-started/quickstart)
-- [Git commits — Conventional Commits](https://www.conventionalcommits.org/)
-
----
-
-## ✨ Done!
-
-Fichiers pushés, documentation à jour, commandes prêtes pour le monde. 🪶
+module.exports = {
+  commands,
+  isConstructionCommand,
+  handleCommand,
+};

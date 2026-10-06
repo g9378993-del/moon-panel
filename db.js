@@ -1,10 +1,6 @@
-// Stockage PAR SERVEUR. Chaque serveur Discord a son propre "coffre" :
-// produits, clés, rôles liés, blacklist, config, panels, permissions.
-// Rien n'est partagé entre serveurs : un nouveau serveur démarre à zéro.
-//
-// Tout est gardé en mémoire (lectures instantanées), écrit en local
-// (data/store.json) ET sur MongoDB si MONGODB_URI est configuré.
-// Sans Mongo, ça ne survit pas à un redéploiement Render (plan gratuit).
+// Stockage PAR SERVEUR (chaque serveur a sa propre config, ses warns, etc.).
+// Même principe que Moon Bot : MongoDB si MONGODB_URI est configuré, sinon
+// fichier local (non persistant entre redéploiements Render).
 
 const fs = require('fs');
 const path = require('path');
@@ -15,127 +11,88 @@ const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 
-// Anciens fichiers (avant le passage au multi-serveurs), lus une seule fois
-// pour la migration vers ton serveur principal (GUILD_ID).
-const LEGACY = {
-  keys: { file: 'keys.json', fallback: [] },
-  products: { file: 'products.json', fallback: {} },
-  roleMap: { file: 'roleMap.json', fallback: {} },
-  blacklist: { file: 'blacklist.json', fallback: {} },
-  config: { file: 'config.json', fallback: {} },
-  panels: { file: 'panels.json', fallback: [] },
-};
-
-function defaultGlobal() { return { disabledGuildIds: [], legacyMigrated: false, guildLog: [] }; }
-
-function defaultConfig() {
+function defaultGuild() {
   return {
-    language: 'en',
-    visibility: 'private', // 'private' (éphémère) ou 'public' pour les réponses sans clé
-    killswitchGlobal: false,
-    hwidCooldownHours: 0,
-    panelColor: 0x5865F2,
-    panelTitle: null,
-    panelDescription: null,
-    panelFooter: 'Made by aln',
-    buttonEmojis: { key_get: '🔑', key_redeem: '📥', view_script: '📜', key_info: '📊', get_buyer_role: '👤', reset_hwid: '🔄' },
+    staffRoles: [],           // rôles (en plus d'Administrateur/Gérer le serveur) autorisés à modérer
+    modLogChannelId: null,    // salon où sont postés kick/ban/warn/etc.
+    constructionMode: false,  // mode construction du serveur (gestion des salons)
+    nextCaseId: 1,
+    cases: [],                // { id, type, userId, moderatorId, reason, createdAt, extra }
+    automod: {
+      antiLink: { enabled: false },
+      antiSpam: { enabled: true, maxMessages: 6, perSeconds: 7, timeoutMinutes: 10 },
+      antiMention: { enabled: true, maxMentions: 5, timeoutMinutes: 10 },
+      badWords: { enabled: false, words: [] },
+      profanity: { enabled: true },  // filtre intégré multilingue de gros mots (/automod grosmots)
+      antiRaid: { enabled: true, joinThreshold: 6, windowSeconds: 20, minAccountAgeDays: 3, action: 'timeout' }, // action: 'timeout' | 'kick' | 'alert_only'
+      antialts: { enabled: false, minAccountAgeDays: 7, action: 'kick' }, // action: 'kick' | 'timeout'
+    },
+    warnThresholds: [
+      { count: 3, action: 'timeout', minutes: 60 },
+      { count: 5, action: 'timeout', minutes: 1440 },
+      { count: 7, action: 'ban', minutes: null },
+    ],
+    lockedChannels: {},       // channelId -> permissions @everyone d'avant verrouillage (pour /unlock)
+    aiChannels: [],           // salons où l'IA répond à TOUS les messages, pas juste aux mentions
+    aiEnabled: true,          // interrupteur général : répondre quand le bot est mentionné
+    aiLanguage: null,         // langue principale par défaut (/language), ex: "français", "english"...
+    aiPersona: null,          // instruction supplémentaire optionnelle (ton, personnalité)
+    cmdPerms: {},             // commande -> [roleId] autorisés en plus du staff (/permscmnds)
+    tickets: {
+      enabled: false,
+      categoryId: null,       // catégorie où sont créés les salons de tickets
+      supportRoleId: null,    // rôle support ajouté automatiquement à chaque ticket
+      panelChannelId: null,   // salon où est posté le panneau (/ticket panel)
+      panelMessageId: null,
+      welcomeMessage: null,   // message d'accueil personnalisé optionnel
+      counter: 1,             // numéro du prochain ticket
+      open: {},                // channelId -> { userId, claimedBy, createdAt, number }
+    },
   };
 }
-
-function defaultGuild(botJoinedAt = null) {
+function defaultUser() {
   return {
-    botJoinedAt,
-    setupDone: false, // tant que /start n'a pas été fait, AUCUNE commande ne marche
-    setupAt: null,
-    config: defaultConfig(),
-    allowedRoles: [],
-    allowedUsers: [],
-    products: {},
-    keys: [],
-    roleMap: {},
-    blacklist: {},
-    panels: [], // { messageId, channelId, createdAt, buttons: [], productIds: [] }
-    // PolSec fields
-    scripts: {},
-    scriptRoleMap: {},
-    hwidBlacklist: {},
-    keyTrials: {},
+    language: null, // code ISO 639-1 (ex: 'fr', 'en', 'es') détecté lors du dernier échange avec l'IA
   };
 }
-
 function normalizeGuild(data) {
   const base = defaultGuild();
   const d = data || {};
-  return { ...base, ...d, config: { ...base.config, ...(d.config || {}) } };
+  return {
+    ...base, ...d,
+    automod: {
+      antiLink: { ...base.automod.antiLink, ...(d.automod?.antiLink || {}) },
+      antiSpam: { ...base.automod.antiSpam, ...(d.automod?.antiSpam || {}) },
+      antiMention: { ...base.automod.antiMention, ...(d.automod?.antiMention || {}) },
+      badWords: { ...base.automod.badWords, ...(d.automod?.badWords || {}) },
+      profanity: { ...base.automod.profanity, ...(d.automod?.profanity || {}) },
+      antiRaid: { ...base.automod.antiRaid, ...(d.automod?.antiRaid || {}) },
+      antialts: { ...base.automod.antialts, ...(d.automod?.antialts || {}) },
+    },
+    tickets: {
+      ...base.tickets,
+      ...(d.tickets || {}),
+      open: { ...(d.tickets?.open || {}) },
+    },
+  };
 }
 
-const state = { global: defaultGlobal(), guilds: {} };
+const state = { guilds: {}, users: {} };
 let collection = null;
 let mongoReady = false;
+const status = { uriSet: false, mongoConnected: false, connectError: null, lastSaveError: null };
 
 function readLocalStore() {
   try {
     const raw = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
-    state.global = { ...defaultGlobal(), ...(raw.global || {}) };
     for (const [id, g] of Object.entries(raw.guilds || {})) state.guilds[id] = normalizeGuild(g);
+    for (const [id, u] of Object.entries(raw.users || {})) state.users[id] = { ...defaultUser(), ...u };
   } catch (e) { /* premier démarrage : rien à lire */ }
 }
 function writeLocalStore() {
   try { fs.writeFileSync(STORE_FILE, JSON.stringify(state)); }
   catch (e) { console.error('Écriture locale impossible :', e.message); }
 }
-
-function readLegacyLocal() {
-  const out = {};
-  for (const [name, { file, fallback }] of Object.entries(LEGACY)) {
-    try { out[name] = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8') || JSON.stringify(fallback)); }
-    catch (e) { out[name] = fallback; }
-  }
-  return out;
-}
-
-// Migration : ce que tu avais AVANT (données globales) est rangé dans ton
-// serveur principal (GUILD_ID). Tous les autres serveurs repartent de zéro.
-async function migrateLegacy(legacy) {
-  if (state.global.legacyMigrated) return;
-  const keys = Array.isArray(legacy.keys) ? legacy.keys : [];
-  const products = legacy.products || {};
-  const roleMap = legacy.roleMap || {};
-  const panels = Array.isArray(legacy.panels) ? legacy.panels : [];
-  const hasLegacy = keys.length || Object.keys(products).length || Object.keys(roleMap).length || panels.length;
-
-  if (!hasLegacy) { state.global.legacyMigrated = true; await saveGlobal(); return; }
-
-  const homeId = process.env.GUILD_ID;
-  if (!homeId) {
-    console.warn('⚠️ Anciennes données trouvées mais GUILD_ID est vide : migration reportée (mets GUILD_ID = ton serveur principal).');
-    return;
-  }
-  if (!state.guilds[homeId]) {
-    const oldCfg = legacy.config || {};
-    const g = defaultGuild();
-    const { panelButtons, disabledGuildIds, ...cfg } = oldCfg;
-    g.config = { ...g.config, ...cfg };
-    g.setupDone = true; // ton serveur principal est déjà configuré
-    g.setupAt = Date.now();
-    g.products = products;
-    g.keys = keys;
-    g.roleMap = roleMap;
-    g.blacklist = legacy.blacklist || {};
-    const legacyButtons = [...new Set([...(panelButtons || ['key_get', 'reset_hwid']), 'key_redeem'])];
-    g.panels = panels.map((p) => ({ ...p, buttons: legacyButtons, productIds: Object.keys(products) }));
-    state.guilds[homeId] = g;
-    await save(homeId);
-    if (Array.isArray(disabledGuildIds) && disabledGuildIds.length) {
-      state.global.disabledGuildIds = [...new Set([...(state.global.disabledGuildIds || []), ...disabledGuildIds])];
-    }
-    console.log(`Migration : anciennes données rangées dans le serveur ${homeId}.`);
-  }
-  state.global.legacyMigrated = true;
-  await saveGlobal();
-}
-
-const status = { uriSet: false, mongoConnected: false, connectError: null, lastSaveError: null, lastSaveAt: null };
 
 async function connectMongo(uri) {
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -152,9 +109,11 @@ async function connectMongo(uri) {
   return null;
 }
 
+// IMPORTANT : le serveur web (server.js) doit démarrer AVANT que cette
+// fonction soit attendue, sinon Render tue l'app pendant les tentatives
+// MongoDB (voir index.js, ordre de démarrage).
 async function initDb() {
   const uri = process.env.MONGODB_URI;
-  let legacy = null;
   status.uriSet = !!uri;
 
   if (uri && !MongoClient) status.connectError = "le paquet 'mongodb' n'est pas installé";
@@ -162,68 +121,66 @@ async function initDb() {
     const client = await connectMongo(uri);
     if (client) {
       try {
-        collection = client.db('panelbot').collection('store');
+        collection = client.db('modbot').collection('store');
         const docs = await collection.find({}).toArray();
-        const legacyMongo = {};
         for (const doc of docs) {
-          if (doc._id === 'global') state.global = { ...defaultGlobal(), ...doc.data };
-          else if (String(doc._id).startsWith('guild:')) state.guilds[String(doc._id).slice(6)] = normalizeGuild(doc.data);
-          else if (LEGACY[doc._id]) legacyMongo[doc._id] = doc.data;
+          const id = String(doc._id);
+          if (id.startsWith('guild:')) state.guilds[id.slice(6)] = normalizeGuild(doc.data);
+          else if (id.startsWith('user:')) state.users[id.slice(5)] = { ...defaultUser(), ...doc.data };
         }
         mongoReady = true;
         status.mongoConnected = true;
         status.connectError = null;
-        legacy = { ...readLegacyLocal(), ...legacyMongo };
         console.log(`MongoDB connecté — données persistantes activées (${Object.keys(state.guilds).length} serveur(s) chargé(s)).`);
       } catch (e) {
         status.connectError = e.message;
         console.error('Lecture MongoDB impossible :', e.message);
       }
     }
-    if (!mongoReady) console.error('⚠️ MongoDB inaccessible : le bot tourne SANS stockage persistant, les données seront perdues au redémarrage.');
-  } else if (!uri) {
+    if (!mongoReady) console.error('⚠️ MongoDB inaccessible : le bot tourne SANS stockage persistant.');
+  } else {
     console.log('MongoDB non configuré (MONGODB_URI absent) : stockage local uniquement, NON persistant sur Render.');
   }
-
-  if (!mongoReady) { readLocalStore(); legacy = readLegacyLocal(); }
-  await migrateLegacy(legacy);
+  if (!mongoReady) readLocalStore();
 }
 
-// ---- API ----
 function peek(guildId) { return state.guilds[guildId] || null; }
 function get(guildId) {
   if (!state.guilds[guildId]) state.guilds[guildId] = defaultGuild();
   return state.guilds[guildId];
 }
-function all() { return state.guilds; }
+// Stockage PAR UTILISATEUR, indépendant des serveurs : sert uniquement à
+// retenir la langue avec laquelle l'IA doit lui parler, pour lui répondre
+// pareil la prochaine fois même sur un autre salon/serveur.
+function peekUser(userId) { return state.users[userId] || null; }
+function getUser(userId) {
+  if (!state.users[userId]) state.users[userId] = defaultUser();
+  return state.users[userId];
+}
 function getStatus() { return { ...status, persistent: mongoReady }; }
-function getGlobal() { return state.global; }
 
 async function mongoWrite(id, data) {
   for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      await collection.updateOne({ _id: id }, { $set: { data } }, { upsert: true });
-      status.lastSaveError = null;
-      status.lastSaveAt = Date.now();
-      return;
-    } catch (e) {
-      status.lastSaveError = e.message;
-      console.error(`Erreur écriture MongoDB (essai ${attempt}/2) :`, e.message);
-    }
+    try { await collection.updateOne({ _id: id }, { $set: { data } }, { upsert: true }); status.lastSaveError = null; return; }
+    catch (e) { status.lastSaveError = e.message; console.error(`Erreur écriture MongoDB (essai ${attempt}/2) :`, e.message); }
   }
 }
 async function save(guildId) {
   writeLocalStore();
   if (mongoReady && collection && state.guilds[guildId]) await mongoWrite(`guild:${guildId}`, state.guilds[guildId]);
 }
-async function saveGlobal() {
+async function saveUser(userId) {
   writeLocalStore();
-  if (mongoReady && collection) await mongoWrite('global', state.global);
-}
-// Remet un serveur complètement à zéro (bot ré-ajouté).
-async function reset(guildId, botJoinedAt = null) {
-  state.guilds[guildId] = defaultGuild(botJoinedAt);
-  await save(guildId);
+  if (mongoReady && collection && state.users[userId]) await mongoWrite(`user:${userId}`, state.users[userId]);
 }
 
-module.exports = { initDb, peek, get, all, save, reset, getGlobal, saveGlobal, getStatus };
+// Ajoute un cas de modération (kick/ban/warn/timeout/automod...) et renvoie
+// son numéro. Toujours appelé + suivi d'un db.save(guildId) par l'appelant.
+function addCase(g, { type, userId, moderatorId, reason, extra }) {
+  const record = { id: g.nextCaseId++, type, userId, moderatorId, reason: reason || 'Aucune raison fournie', extra: extra || null, createdAt: Date.now() };
+  g.cases.push(record);
+  if (g.cases.length > 2000) g.cases = g.cases.slice(-2000); // garde-fou, évite une croissance infinie
+  return record;
+}
+
+module.exports = { initDb, peek, get, save, getStatus, addCase, defaultGuild, peekUser, getUser, saveUser };
