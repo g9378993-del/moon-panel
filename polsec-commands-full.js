@@ -11,7 +11,7 @@
  */
 
 const {
-  EmbedBuilder, SlashCommandBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder
+  EmbedBuilder, SlashCommandBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder, MessageFlags
 } = require('discord.js');
 const crypto = require('crypto');
 
@@ -171,7 +171,7 @@ async function handlePolSecCommand(interaction, guild, g, {
 
   const reply = async (content) => {
     try {
-      if (interaction.replied) return await interaction.followUp({ content, ephemeral: SENSITIVE_CMDS.has(cmd) });
+      if (interaction.replied) return await interaction.followUp({ content, flags: SENSITIVE_CMDS.has(cmd) ? MessageFlags.Ephemeral : 0 });
       return await interaction.editReply({ content });
     } catch (e) {
       console.error(`Error replying to ${cmd}:`, e.message);
@@ -181,7 +181,7 @@ async function handlePolSecCommand(interaction, guild, g, {
 
   const replyEmbed = async (embed) => {
     try {
-      if (interaction.replied) return await interaction.followUp({ embeds: [embed], ephemeral: SENSITIVE_CMDS.has(cmd) });
+      if (interaction.replied) return await interaction.followUp({ embeds: [embed], flags: SENSITIVE_CMDS.has(cmd) ? MessageFlags.Ephemeral : 0 });
       return await interaction.editReply({ embeds: [embed] });
     } catch (e) {
       console.error(`Error replying embed to ${cmd}:`, e.message);
@@ -191,7 +191,7 @@ async function handlePolSecCommand(interaction, guild, g, {
 
   const replyPrivate = async (content) => {
     try {
-      return await interaction.followUp({ content, ephemeral: true });
+      return await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
     } catch (e) {
       console.error(`Error replying private to ${cmd}:`, e.message);
       return null;
@@ -201,7 +201,7 @@ async function handlePolSecCommand(interaction, guild, g, {
   // Defer with special handling for whitelist (needs public response)
   if (!interaction.deferred) {
     const isWhitelist = cmd === 'whitelist';
-    await interaction.deferReply({ ephemeral: isWhitelist ? false : SENSITIVE_CMDS.has(cmd) });
+    await interaction.deferReply({ flags: isWhitelist ? 0 : (SENSITIVE_CMDS.has(cmd) ? MessageFlags.Ephemeral : 0) });
   }
 
   try {

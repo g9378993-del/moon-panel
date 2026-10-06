@@ -248,7 +248,7 @@ async function offerPanelUpdate(interaction, g) {
       ? L('Un panel existe déjà. Veux-tu lui appliquer ce changement ?', 'A panel already exists. Apply this change to it?')
       : L(`Plusieurs panels existent (${panels.length}). Lequel mettre à jour ?`, `Several panels exist (${panels.length}). Which one should be updated?`),
     components: [row],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -669,7 +669,7 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
 // ----------------------------------------------------------------
 async function handleOwnerCommand(interaction) {
   const cmd = interaction.commandName;
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   if (!isBotOwner(interaction.user.id)) {
     await interaction.editReply({ content: '❌ Cette commande est réservée au propriétaire du bot (OWNER_ID).' });
     return;
@@ -738,7 +738,7 @@ async function handleOwnerCommand(interaction) {
     if (group.length) messages.push(group);
 
     await interaction.editReply({ embeds: messages[0], allowedMentions: { parse: [] } });
-    for (const m of messages.slice(1)) await interaction.followUp({ embeds: m, ephemeral: true, allowedMentions: { parse: [] } });
+    for (const m of messages.slice(1)) await interaction.followUp({ embeds: m, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
     return;
   }
 
@@ -760,7 +760,7 @@ async function handleOwnerCommand(interaction) {
 // ----------------------------------------------------------------
 async function handleStartCommand(interaction, guild) {
   if (!(isBotOwner(interaction.user.id) || isGuildOwner(interaction, guild))) {
-    await interaction.reply({ content: '❌ Seul le propriétaire du serveur peut lancer `/start`.\n❌ Only the server owner can run `/start`.', ephemeral: true });
+    await interaction.reply({ content: '❌ Seul le propriétaire du serveur peut lancer `/start`.\n❌ Only the server owner can run `/start`.', flags: MessageFlags.Ephemeral });
     return;
   }
   const select = new StringSelectMenuBuilder()
@@ -776,13 +776,13 @@ async function handleStartCommand(interaction, guild) {
   await interaction.reply({
     content: '🌍 **Configuration — étape 1/2**\nDans quelle langue le bot doit-il te parler (et parler à tes membres) ?\n\n**Setup — step 1/2**\nWhich language should the bot use with you (and your members)?',
     components: [new ActionRowBuilder().addComponents(select)],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
 async function handleStartComponent(interaction, guild, g) {
   if (!(isBotOwner(interaction.user.id) || isGuildOwner(interaction, guild))) {
-    await interaction.reply({ content: '❌ Seul le propriétaire du serveur peut faire ça. / Only the server owner can do this.', ephemeral: true });
+    await interaction.reply({ content: '❌ Seul le propriétaire du serveur peut faire ça. / Only the server owner can do this.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -838,7 +838,7 @@ async function handleChatCommand(interaction, guild, g) {
   if (cmd === 'panel') {
     const draft = { buttons: new Set(), productIds: new Set(), channelId: interaction.channelId, createdAt: Date.now() };
     panelDrafts.set(`${gid}:${uid}`, draft);
-    await interaction.reply({ ...renderPanelDraft(g, draft), ephemeral: true });
+    await interaction.reply({ ...renderPanelDraft(g, draft), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -848,7 +848,7 @@ async function handleChatCommand(interaction, guild, g) {
     const stock = interaction.options.getInteger('stock') || 0;
     const expireDays = interaction.options.getInteger('expiration_jours') || 0;
     const id = slugify(name);
-    if (g.products[id]) { await interaction.reply({ content: L('❌ Un produit avec ce nom existe déjà.', '❌ A product with this name already exists.'), ephemeral: true }); return; }
+    if (g.products[id]) { await interaction.reply({ content: L('❌ Un produit avec ce nom existe déjà.', '❌ A product with this name already exists.'), flags: MessageFlags.Ephemeral }); return; }
     pendingProducts.set(`${gid}:${uid}`, { id, name, stock, expireDays });
     const modal = new ModalBuilder().setCustomId('modal_addproduct').setTitle(L(`Script pour ${name}`, `Script for ${name}`).slice(0, 45));
     const scriptInput = new TextInputBuilder().setCustomId('script_content').setLabel(L('Lien Pastebin/Pastefy (raw) ou code', 'Pastebin/Pastefy (raw) link or code')).setStyle(TextInputStyle.Paragraph).setRequired(true);
@@ -863,7 +863,7 @@ async function handleChatCommand(interaction, guild, g) {
   let deferred = false;
   for (let i = 0; i < 3; i++) {
     try {
-      await interaction.deferReply({ ephemeral: isEphemeral });
+      await interaction.deferReply({ flags: isEphemeral ? MessageFlags.Ephemeral : 0 });
       deferred = true;
       break;
     } catch (e) {
@@ -1271,7 +1271,7 @@ async function handleButton(interaction, guild, g) {
 
   // ---- Boutons d'administration (brouillon de panel, mise à jour) ----
   if (id.startsWith('panel_') || id.startsWith('panelupdate_')) {
-    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), ephemeral: true }); return; }
+    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), flags: MessageFlags.Ephemeral }); return; }
 
     if (id === 'panel_add_product') {
       const modal = new ModalBuilder().setCustomId('modal_quick_addproduct').setTitle(L('Ajouter un produit', 'Add a product'));
@@ -1307,7 +1307,7 @@ async function handleButton(interaction, guild, g) {
         await trackPanel(gid, g, message, panel);
       } catch (e) {
         console.error('Publication du panel impossible :', e.message);
-        await interaction.reply({ content: L("❌ Je n'ai pas pu envoyer le panel dans ce salon (permissions : voir le salon, envoyer des messages, intégrer des liens).", "❌ I couldn't post the panel in this channel (permissions: view channel, send messages, embed links)."), ephemeral: true });
+        await interaction.reply({ content: L("❌ Je n'ai pas pu envoyer le panel dans ce salon (permissions : voir le salon, envoyer des messages, intégrer des liens).", "❌ I couldn't post the panel in this channel (permissions: view channel, send messages, embed links)."), flags: MessageFlags.Ephemeral });
         return;
       }
       panelDrafts.delete(`${gid}:${uid}`);
@@ -1353,7 +1353,7 @@ async function handleButton(interaction, guild, g) {
 
   // key_redeem / reset_hwid ouvrent une fenêtre : réponse immédiate sans defer
   if (id === 'key_redeem' || id === 'reset_hwid') {
-    if (blacklisted) { await interaction.reply({ content: t(lang, 'msg_blacklisted'), ephemeral: true }); return; }
+    if (blacklisted) { await interaction.reply({ content: t(lang, 'msg_blacklisted'), flags: MessageFlags.Ephemeral }); return; }
     const isRedeem = id === 'key_redeem';
     const modal = new ModalBuilder().setCustomId(isRedeem ? 'modal_redeem' : 'modal_hwid_reset').setTitle(t(lang, isRedeem ? 'modal_redeem_title' : 'modal_hwid_title'));
     const keyInput = new TextInputBuilder().setCustomId('key_value').setLabel(t(lang, isRedeem ? 'modal_redeem_label' : 'modal_hwid_label')).setStyle(TextInputStyle.Short).setRequired(true);
@@ -1363,7 +1363,7 @@ async function handleButton(interaction, guild, g) {
   }
 
   if (id === 'key_get') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
     const member = interaction.member;
     const lines = [];
@@ -1380,7 +1380,7 @@ async function handleButton(interaction, guild, g) {
   }
 
   if (id === 'view_script') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
     const owned = findKeysByUser(g, uid).filter((k) => pids.has(k.productId));
     if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
@@ -1399,7 +1399,7 @@ async function handleButton(interaction, guild, g) {
   }
 
   if (id === 'key_info') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
     const owned = findKeysByUser(g, uid).filter((k) => pids.has(k.productId));
     if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
@@ -1415,7 +1415,7 @@ async function handleButton(interaction, guild, g) {
   }
 
   if (id === 'get_buyer_role') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     if (blacklisted) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
     const entries = Object.entries(g.roleMap).filter(([, productId]) => pids.has(productId));
     if (entries.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_role_configured') }); return; }
@@ -1472,7 +1472,7 @@ async function handleSelect(interaction, guild, g) {
 
   // ---- Admin : brouillon de panel / choix du panel à mettre à jour ----
   if (id === 'panel_sel_buttons' || id === 'panel_sel_products' || id === 'select_panel_update') {
-    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), ephemeral: true }); return; }
+    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), flags: MessageFlags.Ephemeral }); return; }
 
     if (id === 'select_panel_update') {
       await interaction.deferUpdate();
@@ -1533,10 +1533,10 @@ async function handleModal(interaction, guild, g) {
 
   // ---- Admin : ajout de produit ----
   if (id === 'modal_addproduct' || id === 'modal_quick_addproduct') {
-    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), ephemeral: true }); return; }
+    if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), flags: MessageFlags.Ephemeral }); return; }
     const fromDraft = id === 'modal_quick_addproduct' && typeof interaction.isFromMessage === 'function' && interaction.isFromMessage();
-    if (fromDraft) await interaction.deferUpdate(); else await interaction.deferReply({ ephemeral: true });
-    const say = (content) => (fromDraft ? interaction.followUp({ content, ephemeral: true }) : interaction.editReply({ content }));
+    if (fromDraft) await interaction.deferUpdate(); else await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const say = (content) => (fromDraft ? interaction.followUp({ content, flags: MessageFlags.Ephemeral }) : interaction.editReply({ content }));
 
     let info;
     if (id === 'modal_addproduct') {
@@ -1567,7 +1567,7 @@ async function handleModal(interaction, guild, g) {
     if (fromDraft) {
       const draft = getDraft(gid, uid);
       if (draft) { draft.productIds.add(info.id); await interaction.editReply(renderPanelDraft(g, draft)); }
-      await interaction.followUp({ content: doneMsg, ephemeral: true });
+      await interaction.followUp({ content: doneMsg, flags: MessageFlags.Ephemeral });
     } else {
       await interaction.editReply({ content: doneMsg });
       await offerPanelUpdate(interaction, g);
@@ -1576,7 +1576,7 @@ async function handleModal(interaction, guild, g) {
   }
 
   // ---- Membres ----
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const pids = panelProductIds(g, interaction);
 
   if (id === 'modal_hwid_reset') {
@@ -1638,7 +1638,7 @@ async function routeInteraction(interaction) {
   // Serveur désactivé par toi : on bloque tout, sauf pour toi (OWNER_ID).
   if (interaction.guildId && !botOwner && (db.getGlobal().disabledGuildIds || []).includes(interaction.guildId)) {
     if (interaction.isAutocomplete()) { await interaction.respond([]).catch(() => {}); return; }
-    if (interaction.isRepliable()) await interaction.reply({ content: '❌ Ce bot est désactivé sur ce serveur. / This bot is disabled on this server.', ephemeral: true }).catch(() => {});
+    if (interaction.isRepliable()) await interaction.reply({ content: '❌ Ce bot est désactivé sur ce serveur. / This bot is disabled on this server.', flags: MessageFlags.Ephemeral }).catch(() => {});
     return;
   }
 
@@ -1646,7 +1646,7 @@ async function routeInteraction(interaction) {
   if (interaction.isChatInputCommand() && OWNER_CMDS.has(interaction.commandName)) { await handleOwnerCommand(interaction); return; }
 
   if (!interaction.guildId) {
-    if (interaction.isRepliable()) await interaction.reply({ content: 'Utilise cette commande dans un serveur. / Use this in a server.', ephemeral: true });
+    if (interaction.isRepliable()) await interaction.reply({ content: 'Utilise cette commande dans un serveur. / Use this in a server.', flags: MessageFlags.Ephemeral });
     return;
   }
   const guild = interaction.guild || await client.guilds.fetch(interaction.guildId);
@@ -1660,7 +1660,7 @@ async function routeInteraction(interaction) {
   // Tant que /start n'a pas été fait : plus rien ne marche.
   if (!g.setupDone) {
     if (interaction.isAutocomplete()) { await interaction.respond([]); return; }
-    await interaction.reply({ content: NOT_CONFIGURED_MSG, ephemeral: true });
+    await interaction.reply({ content: NOT_CONFIGURED_MSG, flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -1688,11 +1688,11 @@ async function routeInteraction(interaction) {
     // /permissions : uniquement le propriétaire du serveur (ou toi).
     if (interaction.commandName === 'permissions') {
       if (!(botOwner || isGuildOwner(interaction, guild))) {
-        await interaction.reply({ content: L('❌ Seul le propriétaire du serveur peut gérer les permissions.', '❌ Only the server owner can manage permissions.'), ephemeral: true });
+        await interaction.reply({ content: L('❌ Seul le propriétaire du serveur peut gérer les permissions.', '❌ Only the server owner can manage permissions.'), flags: MessageFlags.Ephemeral });
         return;
       }
     } else if (!canManage(interaction, guild, g)) {
-      await interaction.reply({ content: noPermMsg(L), ephemeral: true });
+      await interaction.reply({ content: noPermMsg(L), flags: MessageFlags.Ephemeral });
       return;
     }
     await handleChatCommand(interaction, guild, g);
@@ -1716,7 +1716,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     console.error('Erreur interaction :', err);
     if (interaction.isRepliable && interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: 'Une erreur est survenue. / An error occurred.', ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: 'Une erreur est survenue. / An error occurred.', flags: MessageFlags.Ephemeral }).catch(() => {});
     } else if (interaction.deferred) {
       await interaction.editReply({ content: 'Une erreur est survenue. / An error occurred.' }).catch(() => {});
     }
