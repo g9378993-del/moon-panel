@@ -54,7 +54,7 @@ const BUTTON_DEFS = {
 const OWNER_CMDS = new Set(['ownerinfo', 'disableguild', 'enableguild']);
 // Commandes dont la réponse contient des clés / données perso : toujours privées.
 const SENSITIVE_CMDS = new Set([
-  'genkey', 'whitelist', 'bulkgen', 'lookupkey', 'lookupuser', 'permissions',
+  'genkey', 'bulkgen', 'lookupkey', 'lookupuser', 'permissions',
   'createscript', 'generatekey', 'deletekey', 'resetkeyhwid', 'blacklistuser',
   'unblacklistuser', 'blacklisthwid', 'unblacklisthwid'
 ]);
@@ -389,12 +389,6 @@ const commands = [
   new SlashCommandBuilder()
     .setName('genkey')
     .setDescription("(Admin) Génère/attribue une clé à quelqu'un")
-    .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true))
-    .addStringOption((o) => o.setName('produit').setDescription('Le produit').setRequired(true).setAutocomplete(true)),
-
-  new SlashCommandBuilder()
-    .setName('whitelist')
-    .setDescription("(Admin) Donne le rôle lié au produit (déclenche la clé automatiquement)")
     .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true))
     .addStringOption((o) => o.setName('produit').setDescription('Le produit').setRequired(true).setAutocomplete(true)),
 
@@ -1025,27 +1019,38 @@ async function handleChatCommand(interaction, guild, g) {
   }
 
   if (cmd === 'whitelist') {
-    const target = interaction.options.getUser('utilisateur');
-    const productId = interaction.options.getString('produit');
+    const target = interaction.options.getUser('utilisateur') || interaction.options.getUser('user');
+    const productId = interaction.options.getString('produit') || interaction.options.getString('script_id');
+    if (!target) { await reply('❌ Utilisateur introuvable.'); return; }
     if (g.blacklist[target.id]) { await reply(L('❌ Cet utilisateur est blacklist.', '❌ This user is blacklisted.')); return; }
+
     const linkedRoleId = Object.entries(g.roleMap).find(([, pid]) => pid === productId)?.[0];
     if (linkedRoleId) {
       try {
         const member = await guild.members.fetch(target.id);
         if (member.roles.cache.has(linkedRoleId)) {
-          await reply(L(`ℹ️ <@${target.id}> a déjà ce rôle. Utilise \`/genkey\` pour forcer une nouvelle clé.`, `ℹ️ <@${target.id}> already has this role. Use \`/genkey\` to force a new key.`));
+          await reply(L(`ℹ️ <@${target.id}> a déjà ce rôle.`, `ℹ️ <@${target.id}> already has this role.`));
           return;
         }
         await member.roles.add(linkedRoleId);
-        await reply(L(`✅ Rôle <@&${linkedRoleId}> donné à <@${target.id}> — sa clé sera générée et envoyée automatiquement.`, `✅ Role <@&${linkedRoleId}> given to <@${target.id}> — their key will be generated and sent automatically.`));
       } catch (e) {
         await reply(L("❌ Impossible d'ajouter le rôle (permission Gérer les rôles / hiérarchie).", "❌ Couldn't add the role (Manage Roles permission / role hierarchy)."));
+        return;
       }
-      return;
     }
-    const result = await issueKeyForUser(gid, g, target.id, productId, { bypassStock: true });
-    if (result.error) { await reply(`❌ ${result.error}`); return; }
-    await reply(L(`✅ Clé pour <@${target.id}> : \`${result.key}\` (aucun rôle lié, clé attribuée directement).`, `✅ Key for <@${target.id}>: \`${result.key}\` (no linked role, key assigned directly).`));
+
+    // Trouver le salon du panel publié
+    let panelMention = 'the panel';
+    if (g.panels && g.panels.length > 0 && g.panels[0].channelId) {
+      panelMention = `<#${g.panels[0].channelId}>`;
+    }
+
+    // Message PUBLIC visible par tout le monde dans le salon
+    const ch = interaction.channel || await interaction.client.channels.fetch(interaction.channelId);
+    await ch.send(`<@${target.id}> You have been whitelisted!\nAccess the script through the panel : ${panelMention}`);
+
+    // Confirmation discrète pour l'admin (résout le defer)
+    await interaction.editReply({ content: L(`✅ <@${target.id}> whitelisté.`, `✅ <@${target.id}> whitelisted.`), allowedMentions: { parse: [] } });
     return;
   }
 
