@@ -189,9 +189,19 @@ async function handlePolSecCommand(interaction, guild, g, {
     }
   };
 
-  // Defer with ephemeral for sensitive commands only
+  const replyPrivate = async (content) => {
+    try {
+      return await interaction.followUp({ content, ephemeral: true });
+    } catch (e) {
+      console.error(`Error replying private to ${cmd}:`, e.message);
+      return null;
+    }
+  };
+
+  // Defer with special handling for whitelist (needs public response)
   if (!interaction.deferred) {
-    await interaction.deferReply({ ephemeral: SENSITIVE_CMDS.has(cmd) });
+    const isWhitelist = cmd === 'whitelist';
+    await interaction.deferReply({ ephemeral: isWhitelist ? false : SENSITIVE_CMDS.has(cmd) });
   }
 
   try {
@@ -341,8 +351,8 @@ async function handlePolSecCommand(interaction, guild, g, {
         console.error('Failed to send public whitelist message:', e.message);
       }
       
-      // PRIVATE reply with key
-      await reply(`✅ <@${target.id}> whitelisted!\n🔑 Key: \`${key}\``);
+      // PRIVATE reply with key (only visible to command executor)
+      await replyPrivate(`✅ <@${target.id}> whitelisted!\n🔑 Key: \`${key}\``);
       return;
     }
 
