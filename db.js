@@ -55,6 +55,11 @@ function defaultGuild(botJoinedAt = null) {
     roleMap: {},
     blacklist: {},
     panels: [], // { messageId, channelId, createdAt, buttons: [], productIds: [] }
+    // PolSec fields
+    scripts: {},
+    scriptRoleMap: {},
+    hwidBlacklist: {},
+    keyTrials: {},
   };
 }
 
