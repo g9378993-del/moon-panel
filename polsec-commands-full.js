@@ -316,21 +316,33 @@ async function handlePolSecCommand(interaction, guild, g, {
 
       const scriptName = g.scripts[scriptId]?.name || scriptId;
       
-      // Find panel with this script/product combo
+      // Find panel channel
       let panelChannel = null;
       if (g.panels && g.panels.length > 0) {
-        const panel = g.panels[0]; // Try first panel
+        const panel = g.panels[0];
         if (panel.channelId) {
           try {
-            const channel = await interaction.client.channels.fetch(panel.channelId);
-            panelChannel = channel;
+            panelChannel = await interaction.client.channels.fetch(panel.channelId);
           } catch (e) { /* channel not found */ }
         }
       }
       
-      const msg = `@${interaction.user.username} You have been whitelisted!\nAccess the script through the panel: ${panelChannel ? `<#${panelChannel.id}>` : 'Check pinned panel'}`;
+      // PUBLIC message in current channel (visible to everyone)
+      try {
+        const channel = await interaction.client.channels.fetch(interaction.channelId);
+        await channel.send({
+          embeds: [new EmbedBuilder()
+            .setColor(APP_CONFIG.EMBED_COLOR)
+            .setTitle('✅ Whitelist')
+            .setDescription(`<@${target.id}> You have been whitelisted!\nAccess the script through the panel: ${panelChannel ? `<#${panelChannel.id}>` : 'Check pinned panel'}`)
+          ]
+        });
+      } catch (e) {
+        console.error('Failed to send public whitelist message:', e.message);
+      }
       
-      await reply(msg);
+      // PRIVATE reply with key
+      await reply(`✅ <@${target.id}> whitelisted!\n🔑 Key: \`${key}\``);
       return;
     }
 
