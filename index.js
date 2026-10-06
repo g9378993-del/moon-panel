@@ -1049,8 +1049,9 @@ async function handleChatCommand(interaction, guild, g) {
     const ch = interaction.channel || await interaction.client.channels.fetch(interaction.channelId);
     await ch.send(`<@${target.id}> You have been whitelisted!\nAccess the script through the panel : ${panelMention}`);
 
-    // Confirmation discrète pour l'admin (résout le defer)
-    await interaction.editReply({ content: L(`✅ <@${target.id}> whitelisté.`, `✅ <@${target.id}> whitelisted.`), allowedMentions: { parse: [] } });
+    // Résoudre le defer (obligatoire) puis supprimer immédiatement
+    await interaction.editReply({ content: '✅', allowedMentions: { parse: [] } });
+    await interaction.deleteReply().catch(() => {});
     return;
   }
 
