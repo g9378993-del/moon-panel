@@ -315,14 +315,22 @@ async function handlePolSecCommand(interaction, guild, g, {
       await db.save(gid);
 
       const scriptName = g.scripts[scriptId]?.name || scriptId;
-      const channelName = interaction.channel?.name || 'unknown';
       
-      const embed = new EmbedBuilder()
-        .setColor(0x00ff00)
-        .setTitle('✅ Whitelisted')
-        .setDescription(`<@${target.id}> gained access to **${scriptName}**\n→ Channel: #${channelName} | Status: Ready`);
+      // Find panel with this script/product combo
+      let panelChannel = null;
+      if (g.panels && g.panels.length > 0) {
+        const panel = g.panels[0]; // Try first panel
+        if (panel.channelId) {
+          try {
+            const channel = await interaction.client.channels.fetch(panel.channelId);
+            panelChannel = channel;
+          } catch (e) { /* channel not found */ }
+        }
+      }
       
-      await replyEmbed(embed);
+      const msg = `@${interaction.user.username} You have been whitelisted!\nAccess the script through the panel: ${panelChannel ? `<#${panelChannel.id}>` : 'Check pinned panel'}`;
+      
+      await reply(msg);
       return;
     }
 

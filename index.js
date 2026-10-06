@@ -859,7 +859,18 @@ async function handleChatCommand(interaction, guild, g) {
 
   // Les réponses contenant des clés / données perso sont TOUJOURS privées ;
   // les autres suivent le réglage choisi dans /start.
-  await interaction.deferReply({ ephemeral: SENSITIVE_CMDS.has(cmd) || g.config.visibility !== 'public' });
+  const isEphemeral = SENSITIVE_CMDS.has(cmd) || g.config.visibility !== 'public';
+  let deferred = false;
+  for (let i = 0; i < 3; i++) {
+    try {
+      await interaction.deferReply({ ephemeral: isEphemeral });
+      deferred = true;
+      break;
+    } catch (e) {
+      if (i === 2) throw e;
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
 
   if (cmd === 'permissions') {
     const sub = interaction.options.getSubcommand();
@@ -1657,12 +1668,19 @@ async function routeInteraction(interaction) {
   if (interaction.isAutocomplete()) {
     if (!canManage(interaction, guild, g)) { await interaction.respond([]); return; }
     const focused = interaction.options.getFocused().toLowerCase();
-    const choices = Object.entries(g.products)
-      .filter(([id, p]) => p.name.toLowerCase().includes(focused) || id.includes(focused))
-      .slice(0, 24)
-      .map(([id, p]) => ({ name: p.name, value: id }));
+    const choices = [];
+    
+    // Fast product lookup - only return if matches
+    for (const [id, p] of Object.entries(g.products)) {
+      if (choices.length >= 24) break;
+      if (!p || !p.name) continue;
+      if (p.name.toLowerCase().includes(focused) || id.includes(focused)) {
+        choices.push({ name: p.name, value: id });
+      }
+    }
+    
     if (interaction.commandName === 'killswitch') choices.unshift({ name: L('Tous les produits', 'All products'), value: 'tous' });
-    await interaction.respond(choices.slice(0, 25));
+    await interaction.respond(choices.slice(0, 25)).catch(() => {});
     return;
   }
 
