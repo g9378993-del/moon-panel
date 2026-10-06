@@ -21,6 +21,7 @@ const {
   Routes,
   SlashCommandBuilder,
   Events,
+  MessageFlags,
 } = require('discord.js');
 
 // ----------------------------------------------------------------
