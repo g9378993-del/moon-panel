@@ -1,134 +1,100 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  obfuscate.js — Moon Obf v2.0
-//  Multi-Layer Lua Obfuscator | Hardened Edition
+//  obfuscate.js — Moon Obf v3.0
+//  Architecture complètement différente de la v1
 //
-//  Pipeline (innermost → outermost) :
-//    1. String literals  → string.char() byte reconstruction
-//    2. Integer literals → disguised math expressions
-//    3. Junk code        → dead-code injection entre les vraies lignes
-//    4. César rotatif    → chiffrement byte-par-byte avec clé tournante
-//    5. Byte-wrap outer  → second loader plain autour du loader césar
+//  Pipeline :
+//    1. String literals  → string.char()
+//    2. Integer literals → expressions math
+//    3. Junk code injection
+//    4. César rotatif    → chiffrement byte-par-byte clé tournante
+//    5. Hex-string encode → payload = une longue string hex, pas de {1,2,3}
+//    6. Chunk split      → la hex-string est découpée en N morceaux réassemblés
+//    7. Decoy header     → faux code Lua en tête pour perdre le reverser
 //
-//  Compatible Lua 5.1 / 5.2 / 5.3 / 5.4 (utilise loadstring or load,
-//  math.floor au lieu de //, pas d'opérateur ~ bitwise)
+//  Compatible Lua 5.1 / 5.2 / 5.3 / 5.4
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Entier aléatoire [min, max] */
 function rng(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-/** Identifiant hex pseudo-aléatoire pour les variables Lua générées */
 function uid() {
   const h = '0123456789abcdef';
   let s = '_';
-  for (let i = 0; i < 14; i++) s += h[rng(0, 15)];
+  for (let i = 0; i < 12; i++) s += h[rng(0, 15)];
   return s;
 }
 
-// ── Couche 1 : String literals → string.char() ────────────────────────────
-//  "hello" → (string.char(104,101,108,108,111))
-//  Skips strings vides ou > 60 octets (trop verbeux)
-//  Ne touche pas aux multi-line strings Lua [[...]]
+// ── 1. String literals → string.char() ────────────────────────────────────
 function obfuscateStrings(src) {
   return src.replace(
     /(["'])((?:(?!\2)[^\\\n]|\\.)*)(\2)/g,
-    (_match, _q, inner, _q2) => {
-      // Résoudre les escape sequences basiques
+    (_m, _q, inner) => {
       const unescaped = inner
-        .replace(/\\n/g,  '\n')
-        .replace(/\\t/g,  '\t')
-        .replace(/\\r/g,  '\r')
-        .replace(/\\\\/g, '§BSLASH§')
-        .replace(/\\"/g,  '"')
-        .replace(/\\'/g,  "'")
-        .replace(/§BSLASH§/g, '\\');
-
+        .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r')
+        .replace(/\\\\/g, '\x01').replace(/\\"/g, '"').replace(/\\'/g, "'")
+        .replace(/\x01/g, '\\');
       const bytes = Buffer.from(unescaped, 'utf8');
-      if (bytes.length === 0 || bytes.length > 60) return _match;
+      if (bytes.length === 0 || bytes.length > 60) return _m;
       return `(string.char(${[...bytes].join(',')}))`;
     }
   );
 }
 
-// ── Couche 2 : Integer literals → expressions math déguisées ──────────────
-//  42 → (142-100) ou math.floor(84/2) ou (1042-1000)
+// ── 2. Integer literals → expressions math ────────────────────────────────
 function obfuscateNumbers(src) {
-  return src.replace(/\b(\d+)\b/g, (_match, raw) => {
+  return src.replace(/\b(\d+)\b/g, (_m, raw) => {
     const n = parseInt(raw, 10);
-    // Skip les grands nombres et les flottants (déjà des entiers Lua max)
-    if (n > 65535 || isNaN(n)) return _match;
+    if (n > 65535 || isNaN(n)) return _m;
     if (n === 0) return '(1-1)';
     if (n === 1) return '(2-1)';
-
-    const a = rng(50, 1000);
+    const a = rng(50, 999);
     const forms = [
       `(${n + a}-${a})`,
       `math.floor(${n * 2}/2)`,
-      `math.floor(${n * 3}/3)`,
       `(${a + n}-${a})`,
+      `math.floor(${n * 3}/3)`,
     ];
-    return forms[rng(0, forms.length - 1)];
+    return forms[rng(0, 3)];
   });
 }
 
-// ── Couche 3 : Junk code injection ────────────────────────────────────────
-//  Insère du code mort entre ~35% des lignes non-vides
+// ── 3. Junk code injection ─────────────────────────────────────────────────
 function injectJunk(src) {
   const junk = [
     () => `local ${uid()}=type(nil)`,
     () => `local ${uid()}=math.floor((1-1))`,
-    () => `if false then local ${uid()}=0 end`,
+    () => `if false then local ${uid()}=(1-1) end`,
     () => `do local ${uid()}={} end`,
     () => `local ${uid()}=select(("#"))`,
-    () => `local ${uid()}=tostring(${rng(0, 9999)}-${rng(0, 9999)})`,
-    () => `local ${uid()}=pcall(function()return ${rng(1, 999)} end)`,
-    () => `local ${uid()}=math.floor(math.random()*(1-1))`,
+    () => `local ${uid()}=tostring(math.floor((1-1)))`,
+    () => `local ${uid()}=pcall(function()return math.floor(${rng(1,999)*2}/2) end)`,
   ];
-
-  return src
-    .split('\n')
-    .flatMap(line => {
-      const trimmed = line.trim();
-      const result = [line];
-      const skip =
-        trimmed === '' ||
-        trimmed.startsWith('--') ||
-        trimmed.startsWith('end') ||
-        trimmed.startsWith('else') ||
-        trimmed.startsWith('until');
-
-      if (!skip && Math.random() < 0.35) {
-        result.push(junk[rng(0, junk.length - 1)]());
-      }
-      return result;
-    })
-    .join('\n');
+  return src.split('\n').flatMap(line => {
+    const t = line.trim();
+    const skip = t === '' || t.startsWith('--') ||
+                 t.startsWith('end') || t.startsWith('else') || t.startsWith('until');
+    const result = [line];
+    if (!skip && Math.random() < 0.35)
+      result.push(junk[rng(0, junk.length - 1)]());
+    return result;
+  }).join('\n');
 }
 
-// ── Couche 4 : César rotatif (encryption byte-par-byte) ───────────────────
-//  shift[i] = (key + i) % 256   →  encode = (b + shift) % 256
-//  Décodeur Lua embarqué : decode = (enc - shift + 256) % 256
-//  Fonctionne sur toutes les versions Lua (pas de bit.bxor requis)
+// ── 4. César rotatif ───────────────────────────────────────────────────────
+//  encode: (b + (key + i) % 256) % 256
+//  decode en Lua: (enc - shift + 256) % 256
 function caesarEncode(source) {
-  const key  = rng(15, 220);
+  const key   = rng(15, 220);
   const bytes = [...Buffer.from(String(source), 'utf8')];
+  const enc   = bytes.map((b, i) => (b + (key + i) % 256) % 256);
 
-  // shift_i = (key + i) % 256   (i = 0-based JS index)
-  const encoded = bytes.map((b, i) => (b + (key + i) % 256) % 256);
-
-  const kv  = uid();   // variable clé
-  const ev  = uid();   // array encodé
-  const sv  = uid();   // string result buffer
-  const iv  = uid();   // loop index
-  const shv = uid();   // shift courant
-  const dv  = uid();   // byte décodé
-
+  const kv = uid(), ev = uid(), sv = uid(), iv = uid(), shv = uid(), dv = uid();
   return [
     `local ${kv}=${key}`,
-    `local ${ev}={${encoded.join(',')}}`,
+    `local ${ev}={${enc.join(',')}}`,
     `local ${sv}={}`,
     `for ${iv}=1,#${ev} do`,
     `local ${shv}=(${kv}+(${iv}-1))%256`,
@@ -139,40 +105,84 @@ function caesarEncode(source) {
   ].join('\n');
 }
 
-// ── Couche 5 : Byte-wrap outer ────────────────────────────────────────────
-//  Emballe le loader césar dans un second loader plain-byte
-//  → deux niveaux de loadstring imbriqués dans l'output final
-function byteWrap(source) {
-  const bytes = [...Buffer.from(String(source), 'utf8')];
+// ── 5+6. Hex-string encode + chunk split ──────────────────────────────────
+//  Au lieu de {104,101,...} on génère "68656c6c6f..."
+//  Découpé en N chunks réassemblés dynamiquement
+//  Visuellement rien à voir avec un byte array classique
+function hexChunkWrap(source) {
+  const bytes  = [...Buffer.from(String(source), 'utf8')];
+  const hexStr = bytes.map(b => b.toString(16).padStart(2, '0')).join('');
 
-  const bv = uid();
-  const sv = uid();
-  const iv = uid();
+  // Découpe en chunks de taille variable
+  const chunkSize = rng(60, 120);
+  const chunks = [];
+  for (let i = 0; i < hexStr.length; i += chunkSize)
+    chunks.push(hexStr.slice(i, i + chunkSize));
+
+  const chunkVars = chunks.map(() => uid());
+  const joinVar   = uid();
+  const idxVar    = uid();
+  const decVar    = uid();
+  const bufVar    = uid();
+
+  const chunkLines = chunkVars
+    .map((v, i) => `local ${v}="${chunks[i]}"`)
+    .join('\n');
+
+  const concatExpr = chunkVars.join('..');
 
   return [
-    `local ${bv}={${bytes.join(',')}}`,
-    `local ${sv}={}`,
-    `for ${iv}=1,#${bv} do ${sv}[${iv}]=string.char(${bv}[${iv}]) end`,
-    `(loadstring or load)(table.concat(${sv}))()`,
+    chunkLines,
+    `local ${joinVar}=${concatExpr}`,
+    `local ${bufVar}={}`,
+    `for ${idxVar}=1,#${joinVar},2 do`,
+    `local ${decVar}=tonumber(${joinVar}:sub(${idxVar},${idxVar}+1),16)`,
+    `${bufVar}[#${bufVar}+1]=string.char(${decVar})`,
+    `end`,
+    `(loadstring or load)(table.concat(${bufVar}))()`,
   ].join('\n');
 }
 
+// ── 7. Decoy header ────────────────────────────────────────────────────────
+//  Faux code Lua en tête : variable names légitimes, logique inaccessible
+//  Distrait un reverser manuel
+function decoyHeader() {
+  const names = ['config','settings','version','build','init','core','base','env'];
+  const lines = [];
+  const count = rng(4, 8);
+  for (let i = 0; i < count; i++) {
+    const v = `${names[rng(0, names.length-1)]}_${uid()}`;
+    const forms = [
+      `local ${v}={}`,
+      `local ${v}=false`,
+      `local ${v}=nil`,
+      `local ${v}=(function()end)`,
+      `local ${v}=math.floor((1-1))`,
+    ];
+    lines.push(forms[rng(0, forms.length-1)]);
+  }
+  return lines.join('\n');
+}
+
 // ── Pipeline principal ─────────────────────────────────────────────────────
-//  Entrée  : source Lua en clair (string)
-//  Sortie  : Lua obfusqué 3 couches (string)
 function obfuscateScript(rawSource) {
   let src = String(rawSource);
 
-  // Transforms au niveau source (avant encoding)
-  src = obfuscateStrings(src);   // strings → string.char()
-  src = obfuscateNumbers(src);   // entiers → expressions math
-  src = injectJunk(src);         // injection dead code
+  // Source-level transforms
+  src = obfuscateStrings(src);
+  src = obfuscateNumbers(src);
+  src = injectJunk(src);
 
-  // Encoding layers (innermost → outermost)
-  src = caesarEncode(src);       // Layer A : chiffrement rotatif
-  src = byteWrap(src);           // Layer B : enveloppe byte-array
+  // Couche de chiffrement
+  src = caesarEncode(src);
 
-  return `-- Moon Obf v2 | Protected\n` + src;
+  // Couche hex+chunks (remplace le byte-array classique)
+  src = hexChunkWrap(src);
+
+  // Decoy en tête
+  const decoy = decoyHeader();
+
+  return `-- Moon Obf v3 | Protected\n${decoy}\n${src}`;
 }
 
 module.exports = { obfuscateScript };
