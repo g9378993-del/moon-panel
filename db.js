@@ -1,6 +1,4 @@
-// Stockage PAR SERVEUR (chaque serveur a sa propre config, ses warns, etc.).
-// Même principe que Moon Bot : MongoDB si MONGODB_URI est configuré, sinon
-// fichier local (non persistant entre redéploiements Render).
+'use strict';
 
 const fs = require('fs');
 const path = require('path');
@@ -11,80 +9,57 @@ const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 
+// ── Structure complète d'un serveur ───────────────────────────────────────
 function defaultGuild() {
   return {
-    staffRoles: [],
-    modLogChannelId: null,
-    constructionMode: false,
-    nextCaseId: 1,
-    cases: [],
-    automod: {
-      antiLink: { enabled: false },
-      antiSpam: { enabled: true, maxMessages: 6, perSeconds: 7, timeoutMinutes: 10 },
-      antiMention: { enabled: true, maxMentions: 5, timeoutMinutes: 10 },
-      badWords: { enabled: false, words: [] },
-      profanity: { enabled: true },
-      antiRaid: { enabled: true, joinThreshold: 6, windowSeconds: 20, minAccountAgeDays: 3, action: 'timeout' },
-      antialts: { enabled: false, minAccountAgeDays: 7, action: 'kick' },
+    setupDone: false,
+    config: {
+      language: null,
+      panelColor: null,
+      panelTitle: null,
+      panelDescription: null,
+      panelFooter: null,
+      buttonEmojis: {},
+      visibility: 'private',
+      hwidCooldownHours: 0,
+      killswitchGlobal: false,
     },
-    warnThresholds: [
-      { count: 3, action: 'timeout', minutes: 60 },
-      { count: 5, action: 'timeout', minutes: 1440 },
-      { count: 7, action: 'ban', minutes: null },
-    ],
-    lockedChannels: {},
-    aiChannels: [],
-    aiEnabled: true,
-    aiLanguage: null,
-    aiPersona: null,
-    cmdPerms: {},
-    tickets: {
-      enabled: false,
-      categoryId: null,
-      supportRoleId: null,
-      panelChannelId: null,
-      panelMessageId: null,
-      welcomeMessage: null,
-      counter: 1,
-      open: {},
-    },
+    products: {},
+    keys: [],
+    allowedRoles: [],
+    allowedUsers: [],
+    panels: [],
+    blacklist: {},
+    roleMap: {},
   };
 }
+
 function defaultUser() {
-  return {
-    language: null,
-  };
+  return { language: null };
 }
-// ── AJOUT : état global (journal des serveurs, etc.) ───────────────────────
+
 function defaultGlobal() {
-  return {
-    guildLog: [],  // { id, name, ownerId, addedAt, removedAt }
-  };
+  return { guildLog: [] };
 }
 
 function normalizeGuild(data) {
   const base = defaultGuild();
   const d = data || {};
   return {
-    ...base, ...d,
-    automod: {
-      antiLink: { ...base.automod.antiLink, ...(d.automod?.antiLink || {}) },
-      antiSpam: { ...base.automod.antiSpam, ...(d.automod?.antiSpam || {}) },
-      antiMention: { ...base.automod.antiMention, ...(d.automod?.antiMention || {}) },
-      badWords: { ...base.automod.badWords, ...(d.automod?.badWords || {}) },
-      profanity: { ...base.automod.profanity, ...(d.automod?.profanity || {}) },
-      antiRaid: { ...base.automod.antiRaid, ...(d.automod?.antiRaid || {}) },
-      antialts: { ...base.automod.antialts, ...(d.automod?.antialts || {}) },
-    },
-    tickets: {
-      ...base.tickets,
-      ...(d.tickets || {}),
-      open: { ...(d.tickets?.open || {}) },
-    },
+    ...base,
+    ...d,
+    config: { ...base.config, ...(d.config || {}) },
+    products: d.products || {},
+    keys: Array.isArray(d.keys) ? d.keys : [],
+    allowedRoles: Array.isArray(d.allowedRoles) ? d.allowedRoles : [],
+    allowedUsers: Array.isArray(d.allowedUsers) ? d.allowedUsers : [],
+    panels: Array.isArray(d.panels) ? d.panels : [],
+    blacklist: d.blacklist || {},
+    roleMap: d.roleMap || {},
   };
 }
 
-// ── state inclut maintenant global ────────────────────────────────────────
+// ── State mémoire ──────────────────────────────────────────────────────────
 const state = { guilds: {}, users: {}, global: null };
 let collection = null;
 let mongoReady = false;
@@ -95,10 +70,10 @@ function readLocalStore() {
     const raw = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
     for (const [id, g] of Object.entries(raw.guilds || {})) state.guilds[id] = normalizeGuild(g);
     for (const [id, u] of Object.entries(raw.users || {})) state.users[id] = { ...defaultUser(), ...u };
-    // ── AJOUT : chargement global ──────────────────────────────────────────
     state.global = { ...defaultGlobal(), ...(raw.global || {}) };
-  } catch (e) { /* premier démarrage : rien à lire */ }
+  } catch (e) { /* premier démarrage */ }
 }
+
 function writeLocalStore() {
   try { fs.writeFileSync(STORE_FILE, JSON.stringify(state)); }
   catch (e) { console.error('Écriture locale impossible :', e.message); }
@@ -134,7 +109,6 @@ async function initDb() {
           const id = String(doc._id);
           if      (id.startsWith('guild:')) state.guilds[id.slice(6)] = normalizeGuild(doc.data);
           else if (id.startsWith('user:'))  state.users[id.slice(5)]  = { ...defaultUser(), ...doc.data };
-          // ── AJOUT : chargement global depuis MongoDB ───────────────────
           else if (id === 'global')         state.global = { ...defaultGlobal(), ...doc.data };
         }
         mongoReady = true;
@@ -148,24 +122,27 @@ async function initDb() {
     }
     if (!mongoReady) console.error('⚠️ MongoDB inaccessible : le bot tourne SANS stockage persistant.');
   } else {
-    console.log('MongoDB non configuré (MONGODB_URI absent) : stockage local uniquement, NON persistant sur Render.');
+    console.log('MongoDB non configuré (MONGODB_URI absent) : stockage local uniquement.');
   }
   if (!mongoReady) readLocalStore();
-  // Garantit que state.global est toujours initialisé même sans fichier local
   if (!state.global) state.global = defaultGlobal();
 }
 
+// ── Accesseurs guilds ──────────────────────────────────────────────────────
 function peek(guildId)    { return state.guilds[guildId] || null; }
 function get(guildId) {
   if (!state.guilds[guildId]) state.guilds[guildId] = defaultGuild();
   return state.guilds[guildId];
 }
+
+// ── Accesseurs users ───────────────────────────────────────────────────────
 function peekUser(userId) { return state.users[userId] || null; }
 function getUser(userId) {
   if (!state.users[userId]) state.users[userId] = defaultUser();
   return state.users[userId];
 }
-// ── AJOUT : getGlobal / saveGlobal ────────────────────────────────────────
+
+// ── Accesseurs global ──────────────────────────────────────────────────────
 function getGlobal() {
   if (!state.global) state.global = defaultGlobal();
   return state.global;
@@ -177,6 +154,7 @@ async function saveGlobal() {
 
 function getStatus() { return { ...status, persistent: mongoReady }; }
 
+// ── Écriture MongoDB ───────────────────────────────────────────────────────
 async function mongoWrite(id, data) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -189,16 +167,20 @@ async function mongoWrite(id, data) {
     }
   }
 }
+
 async function save(guildId) {
   writeLocalStore();
   if (mongoReady && collection && state.guilds[guildId]) await mongoWrite(`guild:${guildId}`, state.guilds[guildId]);
 }
+
 async function saveUser(userId) {
   writeLocalStore();
   if (mongoReady && collection && state.users[userId]) await mongoWrite(`user:${userId}`, state.users[userId]);
 }
 
 function addCase(g, { type, userId, moderatorId, reason, extra }) {
+  if (!g.cases) g.cases = [];
+  if (!g.nextCaseId) g.nextCaseId = 1;
   const record = { id: g.nextCaseId++, type, userId, moderatorId, reason: reason || 'Aucune raison fournie', extra: extra || null, createdAt: Date.now() };
   g.cases.push(record);
   if (g.cases.length > 2000) g.cases = g.cases.slice(-2000);
