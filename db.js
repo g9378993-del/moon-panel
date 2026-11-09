@@ -31,6 +31,11 @@ function defaultGuild() {
     panels: [],
     blacklist: {},
     roleMap: {},
+    // Champs PolSec
+    scripts: {},
+    scriptRoleMap: {},
+    hwidBlacklist: {},
+    keyTrials: {},
   };
 }
 
@@ -56,6 +61,10 @@ function normalizeGuild(data) {
     panels: Array.isArray(d.panels) ? d.panels : [],
     blacklist: d.blacklist || {},
     roleMap: d.roleMap || {},
+    scripts: d.scripts || {},
+    scriptRoleMap: d.scriptRoleMap || {},
+    hwidBlacklist: d.hwidBlacklist || {},
+    keyTrials: d.keyTrials || {},
   };
 }
 
@@ -134,6 +143,7 @@ function get(guildId) {
   if (!state.guilds[guildId]) state.guilds[guildId] = defaultGuild();
   return state.guilds[guildId];
 }
+function all() { return state.guilds; }
 
 // ── Accesseurs users ───────────────────────────────────────────────────────
 function peekUser(userId) { return state.users[userId] || null; }
@@ -187,4 +197,4 @@ function addCase(g, { type, userId, moderatorId, reason, extra }) {
   return record;
 }
 
-module.exports = { initDb, peek, get, save, getStatus, addCase, defaultGuild, peekUser, getUser, saveUser, getGlobal, saveGlobal };
+module.exports = { initDb, peek, get, all, save, getStatus, addCase, defaultGuild, peekUser, getUser, saveUser, getGlobal, saveGlobal };
