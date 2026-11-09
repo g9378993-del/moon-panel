@@ -610,9 +610,11 @@ async function handlePolSecCommand(interaction, guild, g, {
       const scriptId = interaction.options.getString('script_id');
       const role = interaction.options.getRole('role');
 
-      if (!g.scripts[scriptId]) { await reply('❌ Script not found.'); return; }
+      // Les produits sont dans g.products (créés via /addproduct).
+      // g.scripts est l'ancien système PolSec — on redirige vers g.products.
+      if (!g.products[scriptId]) { await reply('❌ Script not found.'); return; }
 
-      g.scripts[scriptId].buyerRole = role.id;
+      g.roleMap[role.id] = scriptId;
       await db.save(gid);
       await reply(`✅ Buyer role set to <@&${role.id}> for \`${scriptId}\``);
       return;
