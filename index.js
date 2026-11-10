@@ -24,13 +24,22 @@ const {
   MessageFlags,
 } = require('discord.js');
 
+// ----------------------------------------------------------------
+// CONFIG
+// ----------------------------------------------------------------
+// Évite que le bot s'arrête complètement sur une erreur imprévue (Render le
+// relancerait, mais on perd la connexion Discord pendant quelques secondes).
 process.on('unhandledRejection', (err) => console.error('Promesse rejetée non gérée :', err));
 process.on('uncaughtException', (err) => console.error('Exception non gérée :', err));
 
 const APP_CONFIG = { KEY_LENGTH: 16, EMBED_COLOR: 0x5865F2, BOT_NAME: 'Script Panel' };
 
+// Lancée tout de suite (voir tout en bas du fichier). Le bot attend cette
+// promesse avant de toucher aux données de db.js, mais elle ne bloque plus
+// le démarrage du serveur web ni la connexion à Discord.
 const dbReadyPromise = db.initDb();
 
+// Boutons que l'owner peut mettre (ou non) sur un panel.
 const PANEL_BUTTON_IDS = ['key_get', 'key_redeem', 'view_script', 'key_info', 'get_buyer_role', 'reset_hwid'];
 const BUTTON_DEFS = {
   key_get: { label: 'btn_get_keys', style: ButtonStyle.Primary, emoji: '🔑' },
@@ -41,23 +50,20 @@ const BUTTON_DEFS = {
   reset_hwid: { label: 'btn_reset_hwid', style: ButtonStyle.Danger, emoji: '🔄' },
 };
 
+// Commandes réservées à TOI (OWNER_ID), utilisables partout.
 const OWNER_CMDS = new Set(['ownerinfo', 'disableguild', 'enableguild']);
+// Commandes dont la réponse contient des clés / données perso : toujours privées.
 const SENSITIVE_CMDS = new Set([
   'genkey', 'bulkgen', 'lookupkey', 'lookupuser', 'permissions',
   'createscript', 'generatekey', 'deletekey', 'resetkeyhwid', 'blacklistuser',
   'unblacklistuser', 'blacklisthwid', 'unblacklisthwid'
 ]);
 
-// Commandes gérées exclusivement par PolSec — ne pas dupliquer dans le routeur natif.
-const POLSEC_EXCLUSIVE = new Set([
-  'createscript', 'generatekey', 'deletekey', 'deleteuserkeys', 'lookupkey',
-  'lookupuser', 'resetkeyhwid', 'sethwidcooldown', 'blacklistuser', 'unblacklistuser',
-  'blacklisthwid', 'unblacklisthwid', 'killswitch', 'trial', 'compensate',
-  'scriptreminder', 'deletescript', 'linkscript', 'unlinkscript', 'setwebhook',
-  'setbuyerrole', 'exportkeys', 'bulkgen', 'whitelist'
-]);
-
+// ----------------------------------------------------------------
+// OUTILS
+// ----------------------------------------------------------------
 const isBotOwner = (userId) => !!process.env.OWNER_ID && userId === process.env.OWNER_ID;
+// Traduction inline des messages admin : L('français', 'english').
 const mk = (lang) => (fr, en) => (lang === 'fr' ? fr : en);
 
 function slugify(name) {
@@ -71,6 +77,9 @@ const findKeysByUser = (g, userId) => g.keys.filter((k) => k.userId === userId);
 const issuedCountForProduct = (g, productId) => g.keys.filter((k) => k.productId === productId).length;
 function fmtDate(ts, lang = 'fr') { return ts ? new Date(ts).toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-GB') : '—'; }
 
+// Qui a le droit d'utiliser les commandes du bot sur ce serveur ?
+// → le propriétaire du serveur, toi (OWNER_ID), et ceux que le propriétaire
+//   a autorisés avec /permissions (personnes ou rôles).
 function isGuildOwner(interaction, guild) { return !!guild && guild.ownerId === interaction.user.id; }
 function canManage(interaction, guild, g) {
   const uid = interaction.user.id;
@@ -82,22 +91,28 @@ function canManage(interaction, guild, g) {
   return g.allowedRoles.some((r) => roleIds.includes(r));
 }
 
+// Identifiant de CETTE copie du bot. Si /ownerinfo affiche des identifiants
+// différents d'une fois sur l'autre, le bot tourne à 2 endroits en même temps.
 const INSTANCE_ID = crypto.randomBytes(2).toString('hex');
 const STARTED_AT = Date.now();
-const dup = { count: 0, lastAt: null };
+const dup = { count: 0, lastAt: null }; // "déjà répondu" = une autre copie du bot répond aussi
+// Permissions de l'invitation : voir/écrire/intégrer/historique/gérer les rôles.
 const INVITE_PERMS = '268520448';
 
 const NOT_CONFIGURED_MSG =
   "⚠️ Le bot n'est pas encore configuré sur ce serveur : le propriétaire doit lancer `/start`.\n" +
   "⚠️ The bot isn't set up on this server yet: the server owner must run `/start`.";
 
+// ----------------------------------------------------------------
+// CLIENT DISCORD
+// ----------------------------------------------------------------
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
   partials: [Partials.Channel, Partials.GuildMember],
 });
 
-const pendingProducts = new Map();
-const panelDrafts = new Map();
+const pendingProducts = new Map(); // `${guildId}:${userId}` → produit en cours de création
+const panelDrafts = new Map(); // `${guildId}:${userId}` → brouillon de panel (boutons + produits choisis)
 const DRAFT_TTL_MS = 30 * 60 * 1000;
 
 function getDraft(gid, uid) {
@@ -107,6 +122,10 @@ function getDraft(gid, uid) {
   return d;
 }
 
+// ----------------------------------------------------------------
+// EMBEDS / COMPOSANTS DU PANEL
+// (chaque panel a SES boutons et SES produits, choisis via /panel)
+// ----------------------------------------------------------------
 function buildPanelEmbed(g, panel) {
   const lang = g.config.language;
   const list = panel.productIds
@@ -137,6 +156,7 @@ function buildPanelButtons(g, panel) {
   return rows;
 }
 
+// Brouillon de panel : l'owner choisit boutons + produits AVANT la publication.
 function renderPanelDraft(g, draft) {
   const lang = g.config.language;
   const L = mk(lang);
@@ -179,6 +199,9 @@ function renderPanelDraft(g, draft) {
   return { content, components: rows };
 }
 
+// ----------------------------------------------------------------
+// SUIVI DES PANELS PUBLIÉS (pour les mettre à jour automatiquement)
+// ----------------------------------------------------------------
 async function trackPanel(gid, g, message, panel) {
   g.panels.push({ messageId: message.id, channelId: message.channelId, createdAt: Date.now(), buttons: panel.buttons, productIds: panel.productIds });
   await db.save(gid);
@@ -192,12 +215,18 @@ async function updatePanelByRecord(gid, g, record) {
     return { ok: true };
   } catch (e) {
     console.error('Erreur mise à jour panel :', e.code || '', e.message);
+    // On ne retire le panel du suivi que s'il a vraiment disparu (message
+    // ou salon supprimé). Pour toute autre erreur (permissions, réseau...),
+    // on le garde en suivi et on remonte le vrai message d'erreur.
     const reallyGone = e.code === 10008 || e.code === 10003;
     if (reallyGone) { g.panels = g.panels.filter((p) => p.messageId !== record.messageId); await db.save(gid); }
     return { ok: false, reason: reallyGone ? 'gone' : (e.message || 'inconnue') };
   }
 }
 
+// Appelée après toute commande qui change l'apparence du panel. Si aucun
+// panel n'existe encore, rien à faire. Sinon, on demande TOUJOURS quoi
+// faire — jamais de mise à jour silencieuse.
 async function offerPanelUpdate(interaction, g) {
   const L = mk(g.config.language);
   const panels = g.panels;
@@ -225,6 +254,9 @@ async function offerPanelUpdate(interaction, g) {
   });
 }
 
+// ----------------------------------------------------------------
+// GÉNÉRATION DE CLÉS (toujours dans le serveur concerné)
+// ----------------------------------------------------------------
 async function issueKeyForUser(gid, g, userId, productId, { bypassStock = false } = {}) {
   const product = g.products[productId];
   if (!product) return { error: "Ce produit n'existe plus." };
@@ -269,7 +301,7 @@ async function createProductFromScriptInput(gid, g, { id, name, stock, expireDay
   const input = scriptInput.trim();
   let rawContent = input;
   if (/^https?:\/\//i.test(input)) {
-    rawContent = await fetchUrl(input);
+    rawContent = await fetchUrl(input); // peut lever une erreur, à catcher par l'appelant
   }
   const obfuscated = obfuscateScript(rawContent);
   const hostedFilename = `${crypto.randomBytes(24).toString('hex')}.lua`;
@@ -297,6 +329,8 @@ function fetchUrl(url, redirects = 0) {
   });
 }
 
+// Loader COURT (2 lignes). Le calcul du HWID n'est plus collé dans le
+// message : il est fourni par le serveur (route /l/<clé>, voir server.js).
 function buildHostedLoader(record) {
   const base = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
   if (!base) {
@@ -360,10 +394,10 @@ const commands = [
     .addStringOption((o) => o.setName('produit').setDescription('Le produit').setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
-    .setName('whitelist')
-    .setDescription("(Admin) Whitelist un utilisateur pour un produit")
-    .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true))
-    .addStringOption((o) => o.setName('produit').setDescription('Le produit').setRequired(true).setAutocomplete(true)),
+    .setName('bulkgen')
+    .setDescription('(Admin) Génère plusieurs clés non attribuées')
+    .addStringOption((o) => o.setName('produit').setDescription('Le produit').setRequired(true).setAutocomplete(true))
+    .addIntegerOption((o) => o.setName('quantite').setDescription('Nombre de clés à générer').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('revokekey')
@@ -371,8 +405,54 @@ const commands = [
     .addStringOption((o) => o.setName('cle').setDescription('La clé exacte').setRequired(true)),
 
   new SlashCommandBuilder()
-    .setName('stats')
-    .setDescription('(Admin) Statistiques du système de clés'),
+    .setName('deletekey')
+    .setDescription('(Admin) Supprime une clé précise (identique à /revokekey)')
+    .addStringOption((o) => o.setName('cle').setDescription('La clé exacte').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('deleteuserkeys')
+    .setDescription("(Admin) Supprime TOUTES les clés d'un utilisateur")
+    .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('lookupkey')
+    .setDescription('(Admin) Infos sur une clé')
+    .addStringOption((o) => o.setName('cle').setDescription('La clé exacte').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('lookupuser')
+    .setDescription("(Admin) Infos sur les clés d'un utilisateur")
+    .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('resetkeyhwid')
+    .setDescription('(Admin) Réinitialise le HWID lié à une clé')
+    .addStringOption((o) => o.setName('cle').setDescription('La clé exacte').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('sethwidcooldown')
+    .setDescription('(Admin) Délai minimum entre deux resets HWID (auto ou manuel)')
+    .addIntegerOption((o) => o.setName('heures').setDescription("Nombre d'heures (0 = pas de délai)").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('killswitch')
+    .setDescription("(Admin) Active/désactive l'accès à un produit (ou tout)")
+    .addStringOption((o) => o.setName('produit').setDescription('Le produit, ou "tous"').setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName('etat').setDescription('on ou off').setRequired(true)
+      .addChoices({ name: "on (désactive l'accès)", value: 'on' }, { name: 'off (réactive)', value: 'off' })),
+
+  new SlashCommandBuilder()
+    .setName('blacklist')
+    .setDescription("(Admin) Bannit quelqu'un du système de clés")
+    .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true))
+    .addStringOption((o) => o.setName('raison').setDescription('Raison').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('unblacklist')
+    .setDescription("(Admin) Retire quelqu'un de la liste noire")
+    .addUserOption((o) => o.setName('utilisateur').setDescription('La personne').setRequired(true)),
+
+  new SlashCommandBuilder().setName('stats').setDescription('(Admin) Statistiques du système de clés'),
 
   new SlashCommandBuilder()
     .setName('setcolor')
@@ -419,10 +499,10 @@ const commands = [
         { name: 'Reset HWID', value: 'reset_hwid' },
       ))
     .addStringOption((o) => o.setName('emoji').setDescription('Le nouvel emoji, ex: 🔥').setRequired(true)),
-
   ...buildPolsecCommands(),
 ].map((c) => c.setDMPermission(false).toJSON());
 
+// Commandes globales réservées à OWNER_ID (toi), utilisables partout.
 const ownerCommands = [
   new SlashCommandBuilder().setName('ownerinfo').setDescription('Statistiques du bot (toi uniquement, dans tous les serveurs)'),
   new SlashCommandBuilder()
@@ -435,17 +515,18 @@ const ownerCommands = [
     .addStringOption((o) => o.setName('guild_id').setDescription("L'ID du serveur").setRequired(true)),
 ].map((c) => c.toJSON());
 
+// Toutes les commandes sont enregistrées en GLOBAL (tous serveurs où le bot
+// est présent). Ça peut prendre un peu de temps pour apparaître partout.
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
     const _seen = new Set();
-    const body = [...commands, ...ownerCommands].filter(c => {
-      if (_seen.has(c.name)) { console.log("Commande dupliquée ignorée : " + c.name); return false; }
-      _seen.add(c.name); return true;
-    });
+    const body = [...commands, ...ownerCommands].filter(c => { if (_seen.has(c.name)) { console.log("Commande dupliquée ignorée : " + c.name); return false; } _seen.add(c.name); return true; });
     await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body });
     console.log(`Commandes slash enregistrées en global (${body.length} commandes).`);
     if (process.env.GUILD_ID) {
+      // Nettoie les anciennes commandes propres au serveur (avant le passage
+      // au global) pour éviter que chaque commande apparaisse deux fois.
       await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: [] });
     }
   } catch (err) {
@@ -453,6 +534,11 @@ async function registerCommands() {
   }
 }
 
+// ----------------------------------------------------------------
+// SERVEURS : chaque serveur démarre à zéro à l'ajout du bot
+// ----------------------------------------------------------------
+// Discord donne la date d'arrivée du bot (joinedTimestamp). Si elle change,
+// c'est que le bot a été retiré puis ré-ajouté → on remet tout à zéro.
 async function syncGuildRecord(guild) {
   const existing = db.peek(guild.id);
   const joined = guild.joinedTimestamp || null;
@@ -479,15 +565,17 @@ async function promptOwnerToStart(guild) {
       `👋 Thanks for adding **${APP_CONFIG.BOT_NAME}** to **${guild.name}**!\n` +
       `Run \`/start\` on the server to set it up (nothing works before that).`
     );
-  } catch (e) { /* DM fermés */ }
+  } catch (e) { /* DM fermés : pas grave, le message "pas configuré" guidera */ }
 }
 
+// MP au propriétaire du bot (toi) : ajout/retrait de serveur, alertes.
 async function notifyBotOwner(text) {
   if (!process.env.OWNER_ID) return;
   try { const u = await client.users.fetch(process.env.OWNER_ID); await u.send(text); }
   catch (e) { console.error('MP au propriétaire du bot impossible :', e.message); }
 }
 
+// Journal PERSISTANT des serveurs : où le bot est ajouté, quand, et retiré.
 async function logGuild(type, guild) {
   const glob = db.getGlobal();
   glob.guildLog = glob.guildLog || [];
@@ -506,13 +594,42 @@ async function logGuild(type, guild) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Connecté en tant que ${client.user.tag} (instance ${INSTANCE_ID})`);
+  // Discord peut annoncer "ready" avant que MongoDB ait fini de charger : on
+  // attend, sinon on risque de traiter tous les serveurs comme "nouveaux"
+  // et de réinitialiser des serveurs déjà configurés.
   await dbReadyPromise;
+
+  // ----------------------------------------------------------------
+  // STARTUP LOCK : détecte et bloque les instances dupliquées
+  // ----------------------------------------------------------------
+  // Utilise MongoDB pour détecter un double démarrage (ex: Termux + Render).
+  // Si une autre instance a émis un heartbeat dans les 60 dernières secondes,
+  // cette instance s'arrête immédiatement : c'est elle qui cause les 40060.
+  if (db.getStatus().persistent) {
+    const glob = db.getGlobal();
+    const now = Date.now();
+    const other = glob.activeInstance;
+    if (other && other.id !== INSTANCE_ID && (now - (other.lastSeen || 0)) < 60000) {
+      console.error(
+        `🚨 INSTANCE DUPLIQUÉE DÉTECTÉE.\n` +
+        `   Autre instance active : ${other.id} (heartbeat il y a ${Math.round((now - other.lastSeen) / 1000)}s).\n` +
+        `   Cette instance (${INSTANCE_ID}) s'arrête pour éviter le double-réponse.\n` +
+        `   → Si tu veux redémarrer, arrête d'abord l'autre instance (Termux ou Render).`
+      );
+      process.exit(0);
+    }
+    glob.activeInstance = { id: INSTANCE_ID, startedAt: now, lastSeen: now };
+    await db.saveGlobal();
+    console.log(`✅ Startup lock acquis (instance ${INSTANCE_ID})`);
+  }
+
   console.log(`Serveurs actuels (${client.guilds.cache.size}) :`, [...client.guilds.cache.values()].map((g) => `${g.name} (${g.id})`).join(' | '));
   for (const guild of client.guilds.cache.values()) {
     const status = await syncGuildRecord(guild);
     if (status === 'reset') console.log(`♻️ Bot ré-ajouté à ${guild.name} : données remises à zéro.`);
     await logGuild('add', guild);
   }
+  // Serveurs où le bot a été retiré pendant qu'il était éteint.
   for (const entry of (db.getGlobal().guildLog || [])) {
     if (!entry.removedAt && !client.guilds.cache.has(entry.id)) await logGuild('remove', { id: entry.id, name: entry.name });
   }
@@ -535,12 +652,15 @@ client.on(Events.GuildCreate, async (guild) => {
   if (status !== 'ok') await promptOwnerToStart(guild);
 });
 client.on(Events.GuildDelete, async (guild) => {
-  if (guild.available === false) return;
+  if (guild.available === false) return; // simple coupure Discord, le bot est toujours dedans
   console.log(`❌ Bot retiré d'un serveur : ${guild.name || guild.id}`);
   await logGuild('remove', guild);
   await notifyBotOwner(`➖ **Bot retiré** du serveur **${guild.name || guild.id}** (\`${guild.id}\`)`);
 });
 
+// ----------------------------------------------------------------
+// AUTO-GÉNÉRATION QUAND UN RÔLE LIÉ EST ATTRIBUÉ
+// ----------------------------------------------------------------
 client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   const gid = newMember.guild.id;
   const g = db.peek(gid);
@@ -566,6 +686,9 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   }
 });
 
+// ----------------------------------------------------------------
+// COMMANDES DU PROPRIÉTAIRE DU BOT (toi) — /ownerinfo, /disableguild, /enableguild
+// ----------------------------------------------------------------
 async function handleOwnerCommand(interaction) {
   const cmd = interaction.commandName;
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -577,6 +700,8 @@ async function handleOwnerCommand(interaction) {
   const disabled = glob.disabledGuildIds || [];
 
   if (cmd === 'ownerinfo') {
+    // On croise le cache du bot ET la liste officielle Discord (API), pour ne
+    // rater aucun serveur où le bot a été ajouté.
     const rows = new Map();
     for (const gd of client.guilds.cache.values()) rows.set(gd.id, { id: gd.id, name: gd.name, ownerId: gd.ownerId, members: gd.memberCount });
     try {
@@ -591,6 +716,7 @@ async function handleOwnerCommand(interaction) {
       return `**${r.name}**\nID : \`${r.id}\`\n👑 ${r.ownerId ? `<@${r.ownerId}>` : '?'} · 👥 ${r.members ?? '?'}\n${status}`;
     });
 
+    // --- Bloc diagnostic : sur quelle copie du bot je parle, et le stockage.
     const st = db.getStatus();
     const invite = `https://discord.com/oauth2/authorize?client_id=${process.env.CLIENT_ID || client.user.id}&scope=bot%20applications.commands&permissions=${INVITE_PERMS}`;
     const diag = [
@@ -606,6 +732,7 @@ async function handleOwnerCommand(interaction) {
       `➕ [Lien pour ajouter CE bot](${invite})`,
     ].filter(Boolean).join('\n');
 
+    // --- Historique des ajouts / retraits (persistant).
     const history = (db.getGlobal().guildLog || []).slice(-12).reverse().flatMap((e) => {
       const out = [`➕ **${e.name}** (\`${e.id}\`) — ajouté <t:${Math.floor(e.addedAt / 1000)}:f>`];
       if (e.removedAt) out.unshift(`➖ **${e.name}** (\`${e.id}\`) — retiré <t:${Math.floor(e.removedAt / 1000)}:f>`);
@@ -621,6 +748,7 @@ async function handleOwnerCommand(interaction) {
     if (cur) embeds.push({ t: `📡 Serveurs où le bot est ajouté (${list.length} au total)`, d: cur });
     embeds.push({ t: '🕘 Historique des ajouts / retraits', d: history });
 
+    // Regroupe en messages de moins de 5500 caractères (limite Discord : 6000).
     const messages = [];
     let group = []; let size = 0;
     for (const e of embeds) {
@@ -636,6 +764,7 @@ async function handleOwnerCommand(interaction) {
     return;
   }
 
+  // disableguild / enableguild
   const guildId = interaction.options.getString('guild_id').trim();
   const targetGuild = client.guilds.cache.get(guildId);
   if (!targetGuild) { await interaction.editReply({ content: "❌ Le bot n'est pas dans un serveur avec cet ID." }); return; }
@@ -648,6 +777,9 @@ async function handleOwnerCommand(interaction) {
   });
 }
 
+// ----------------------------------------------------------------
+// /start : configuration obligatoire (langue + visibilité)
+// ----------------------------------------------------------------
 async function handleStartCommand(interaction, guild) {
   if (!(isBotOwner(interaction.user.id) || isGuildOwner(interaction, guild) || interaction.member?.permissions.has('Administrator'))) {
     await interaction.reply({ content: '❌ Seul le propriétaire du serveur ou un administrateur peut lancer `/start`.\n❌ Only the server owner or an administrator can run `/start`.', flags: MessageFlags.Ephemeral });
@@ -713,6 +845,9 @@ async function handleStartComponent(interaction, guild, g) {
   }
 }
 
+// ----------------------------------------------------------------
+// COMMANDES ADMIN (propriétaire du serveur + personnes/rôles autorisés)
+// ----------------------------------------------------------------
 async function handleChatCommand(interaction, guild, g) {
   const cmd = interaction.commandName;
   const gid = guild.id;
@@ -721,6 +856,7 @@ async function handleChatCommand(interaction, guild, g) {
   const L = mk(lang);
   const reply = (content) => interaction.editReply({ content, allowedMentions: { parse: [] } });
 
+  // /panel : ouvre le brouillon (boutons + produits à choisir AVANT publication)
   if (cmd === 'panel') {
     const draft = { buttons: new Set(), productIds: new Set(), channelId: interaction.channelId, createdAt: Date.now() };
     panelDrafts.set(`${gid}:${uid}`, draft);
@@ -728,6 +864,7 @@ async function handleChatCommand(interaction, guild, g) {
     return;
   }
 
+  // /addproduct ouvre une fenêtre : doit être la toute première réponse
   if (cmd === 'addproduct') {
     const name = interaction.options.getString('nom');
     const stock = interaction.options.getInteger('stock') || 0;
@@ -742,14 +879,8 @@ async function handleChatCommand(interaction, guild, g) {
     return;
   }
 
-  // Commandes PolSec exclusives : router sans defer natif
-  if (POLSEC_EXCLUSIVE.has(cmd)) {
-    const isEph = SENSITIVE_CMDS.has(cmd) || g.config.visibility !== 'public';
-    await interaction.deferReply({ flags: isEph ? MessageFlags.Ephemeral : 0 });
-    await handlePolSecCommand(interaction, guild, g, { db, APP_CONFIG, generateKeyString, t, mk, fmtDate, SENSITIVE_CMDS, canManage });
-    return;
-  }
-
+  // Les réponses contenant des clés / données perso sont TOUJOURS privées ;
+  // les autres suivent le réglage choisi dans /start.
   const isEphemeral = SENSITIVE_CMDS.has(cmd) || g.config.visibility !== 'public';
   let deferred = false;
   for (let i = 0; i < 3; i++) {
@@ -785,6 +916,7 @@ async function handleChatCommand(interaction, guild, g) {
       await reply(sub === 'add-user' ? L(`✅ <@${target.id}> peut maintenant utiliser les commandes.`, `✅ <@${target.id}> can now use the commands.`) : L(`✅ <@${target.id}> n'a plus accès aux commandes.`, `✅ <@${target.id}> can no longer use the commands.`));
       return;
     }
+    // list
     await reply([
       L('👑 Propriétaire du serveur : toujours autorisé.', '👑 Server owner: always allowed.'),
       L('🎭 **Rôles autorisés** : ', '🎭 **Allowed roles**: ') + (g.allowedRoles.map((r) => `<@&${r}>`).join(' ') || L('aucun', 'none')),
@@ -913,13 +1045,172 @@ async function handleChatCommand(interaction, guild, g) {
     return;
   }
 
-  if (cmd === 'revokekey') {
+  if (cmd === 'whitelist') {
+    const target = interaction.options.getUser('utilisateur') || interaction.options.getUser('user');
+    const productId = interaction.options.getString('produit') || interaction.options.getString('script_id');
+    if (!target) { await reply('❌ Utilisateur introuvable.'); return; }
+    if (g.blacklist[target.id]) { await reply(L('❌ Cet utilisateur est blacklist.', '❌ This user is blacklisted.')); return; }
+
+    const linkedRoleId = Object.entries(g.roleMap).find(([, pid]) => pid === productId)?.[0];
+    if (linkedRoleId) {
+      try {
+        const member = await guild.members.fetch(target.id);
+        if (member.roles.cache.has(linkedRoleId)) {
+          await reply(L(`ℹ️ <@${target.id}> a déjà ce rôle.`, `ℹ️ <@${target.id}> already has this role.`));
+          return;
+        }
+        await member.roles.add(linkedRoleId);
+      } catch (e) {
+        await reply(L("❌ Impossible d'ajouter le rôle (permission Gérer les rôles / hiérarchie).", "❌ Couldn't add the role (Manage Roles permission / role hierarchy)."));
+        return;
+      }
+    }
+
+    // Trouver le salon du panel publié
+    let panelMention = 'the panel';
+    if (g.panels && g.panels.length > 0 && g.panels[0].channelId) {
+      panelMention = `<#${g.panels[0].channelId}>`;
+    }
+
+    // Message PUBLIC visible par tout le monde dans le salon
+    const ch = interaction.channel || await interaction.client.channels.fetch(interaction.channelId);
+    await ch.send(`<@${target.id}> You have been whitelisted!\nAccess the script through the panel : ${panelMention}`);
+
+    // Résoudre le defer (obligatoire) puis supprimer immédiatement
+    await interaction.editReply({ content: '✅', allowedMentions: { parse: [] } });
+    await interaction.deleteReply().catch(() => {});
+    return;
+  }
+
+  // ====== PolSec Commands Router ======
+  const polsecCmdNames = new Set([
+    'createscript', 'generatekey', 'bulkgen', 'deletekey', 'whitelist',
+    'lookupkey', 'lookupuser', 'deleteuserkeys', 'resetkeyhwid',
+    'sethwidcooldown', 'blacklistuser', 'unblacklistuser', 'blacklisthwid',
+    'unblacklisthwid', 'killswitch', 'trial', 'compensate', 'scriptreminder',
+    'deletescript', 'linkscript', 'unlinkscript', 'setwebhook', 'setbuyerrole',
+    'exportkeys'
+  ]);
+
+  if (polsecCmdNames.has(cmd)) {
+    await handlePolSecCommand(interaction, guild, g, { db, APP_CONFIG, generateKeyString, t, mk, fmtDate, SENSITIVE_CMDS, canManage });
+    return;
+  }
+
+  if (cmd === 'bulkgen') {
+    const productId = interaction.options.getString('produit');
+    const quantity = interaction.options.getInteger('quantite');
+    if (quantity < 1 || quantity > 100) { await reply(L('❌ Quantité entre 1 et 100.', '❌ Quantity must be between 1 and 100.')); return; }
+    const result = await bulkGenerate(gid, g, productId, quantity, { bypassStock: true });
+    if (result.error) { await reply(`❌ ${result.error}`); return; }
+    await reply(L(`✅ ${quantity} clé(s) générée(s) :\n\`\`\`${result.keys.join('\n')}\`\`\``, `✅ ${quantity} key(s) generated:\n\`\`\`${result.keys.join('\n')}\`\`\``));
+    return;
+  }
+
+  if (cmd === 'revokekey' || cmd === 'deletekey') {
     const value = interaction.options.getString('cle').trim().toUpperCase();
     const idx = g.keys.findIndex((k) => k.key === value);
     if (idx === -1) { await reply(L('❌ Clé introuvable.', '❌ Key not found.')); return; }
     g.keys.splice(idx, 1);
     await db.save(gid);
     await reply(L('✅ Clé supprimée.', '✅ Key deleted.'));
+    return;
+  }
+
+  if (cmd === 'deleteuserkeys') {
+    const target = interaction.options.getUser('utilisateur');
+    const remaining = g.keys.filter((k) => k.userId !== target.id);
+    const removedCount = g.keys.length - remaining.length;
+    g.keys = remaining;
+    await db.save(gid);
+    await reply(L(`✅ ${removedCount} clé(s) supprimée(s) pour <@${target.id}>.`, `✅ ${removedCount} key(s) deleted for <@${target.id}>.`));
+    return;
+  }
+
+  if (cmd === 'lookupkey') {
+    const value = interaction.options.getString('cle').trim().toUpperCase();
+    const record = findKeyByValue(g, value);
+    if (!record) { await reply(L('❌ Clé introuvable.', '❌ Key not found.')); return; }
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(`🔎 ${record.key}`)
+      .addFields(
+        { name: L('Produit', 'Product'), value: g.products[record.productId]?.name || record.productId, inline: true },
+        { name: L('Propriétaire', 'Owner'), value: record.userId ? `<@${record.userId}>` : L('Non réclamée', 'Unclaimed'), inline: true },
+        { name: 'HWID', value: record.hwid || L('Aucun', 'None'), inline: true },
+        { name: L('Créée', 'Created'), value: fmtDate(record.createdAt, lang), inline: true },
+        { name: L('Réclamée', 'Claimed'), value: fmtDate(record.claimedAt, lang), inline: true },
+        { name: L('Expire', 'Expires'), value: record.expiresAt ? fmtDate(record.expiresAt, lang) : L('Jamais', 'Never'), inline: true },
+        { name: L('Utilisée', 'Used'), value: fmtDate(record.redeemedAt, lang), inline: true },
+        { name: L('Lancements', 'Launches'), value: `${record.useCount || 0}`, inline: true },
+        { name: L('Dernier lancement', 'Last launch'), value: fmtDate(record.lastUsedAt, lang), inline: true },
+      );
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (cmd === 'lookupuser') {
+    const target = interaction.options.getUser('utilisateur');
+    const userKeys = findKeysByUser(g, target.id);
+    if (userKeys.length === 0) { await reply(L(`${target.tag} n'a aucune clé.${g.blacklist[target.id] ? ' (Blacklist)' : ''}`, `${target.tag} has no key.${g.blacklist[target.id] ? ' (Blacklisted)' : ''}`)); return; }
+    const embed = new EmbedBuilder().setColor(APP_CONFIG.EMBED_COLOR).setTitle(L(`👤 Clés de ${target.tag}`, `👤 Keys of ${target.tag}`));
+    for (const k of userKeys.slice(0, 25)) {
+      embed.addFields({ name: g.products[k.productId]?.name || k.productId, value: `\`${k.key}\` — ${k.redeemedAt ? t(lang, 'word_used') : t(lang, 'word_unused')}` });
+    }
+    if (g.blacklist[target.id]) embed.setDescription(`⚠️ Blacklist : ${g.blacklist[target.id].reason}`);
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (cmd === 'resetkeyhwid') {
+    const value = interaction.options.getString('cle').trim().toUpperCase();
+    const record = findKeyByValue(g, value);
+    if (!record) { await reply(L('❌ Clé introuvable.', '❌ Key not found.')); return; }
+    record.hwid = null;
+    record.hwidResetAt = Date.now();
+    await db.save(gid);
+    await reply(L(`✅ HWID réinitialisé pour \`${record.key}\`.`, `✅ HWID reset for \`${record.key}\`.`));
+    return;
+  }
+
+  if (cmd === 'sethwidcooldown') {
+    const hours = interaction.options.getInteger('heures');
+    g.config.hwidCooldownHours = hours;
+    await db.save(gid);
+    await reply(L(`✅ Délai de reset HWID : ${hours}h.`, `✅ HWID reset delay: ${hours}h.`));
+    return;
+  }
+
+  if (cmd === 'killswitch') {
+    const productId = interaction.options.getString('produit');
+    const state = interaction.options.getString('etat') === 'on';
+    if (productId === 'tous') {
+      g.config.killswitchGlobal = state;
+      await db.save(gid);
+      await reply(L(`✅ Killswitch global : ${state ? 'activé (tout bloqué)' : 'désactivé'}.`, `✅ Global killswitch: ${state ? 'enabled (everything blocked)' : 'disabled'}.`));
+      await offerPanelUpdate(interaction, g);
+      return;
+    }
+    if (!g.products[productId]) { await reply(L('❌ Produit introuvable.', '❌ Product not found.')); return; }
+    g.products[productId].killswitch = state;
+    await db.save(gid);
+    await reply(L(`✅ ${g.products[productId].name} : ${state ? 'accès bloqué' : 'accès rétabli'}.`, `✅ ${g.products[productId].name}: ${state ? 'access blocked' : 'access restored'}.`));
+    await offerPanelUpdate(interaction, g);
+    return;
+  }
+
+  if (cmd === 'blacklist') {
+    const target = interaction.options.getUser('utilisateur');
+    const reason = interaction.options.getString('raison') || L('Non spécifiée', 'Not specified');
+    g.blacklist[target.id] = { reason, bannedAt: Date.now() };
+    await db.save(gid);
+    await reply(L(`✅ <@${target.id}> blacklist. Raison : ${reason}`, `✅ <@${target.id}> blacklisted. Reason: ${reason}`));
+    return;
+  }
+
+  if (cmd === 'unblacklist') {
+    const target = interaction.options.getUser('utilisateur');
+    delete g.blacklist[target.id];
+    await db.save(gid);
+    await reply(L(`✅ <@${target.id}> retiré de la liste noire.`, `✅ <@${target.id}> removed from the blacklist.`));
     return;
   }
 
@@ -988,6 +1279,9 @@ async function handleChatCommand(interaction, guild, g) {
   }
 }
 
+// ----------------------------------------------------------------
+// PANEL : quels produits sont sur CE panel (selon le message cliqué)
+// ----------------------------------------------------------------
 function panelProductIds(g, interaction) {
   const record = interaction.message ? g.panels.find((p) => p.messageId === interaction.message.id) : null;
   const ids = record ? record.productIds : Object.keys(g.products);
@@ -999,6 +1293,9 @@ const noPermMsg = (L) => L(
   "❌ You don't have permission to use this. Ask the server owner (`/permissions`).",
 );
 
+// ----------------------------------------------------------------
+// BOUTONS
+// ----------------------------------------------------------------
 async function handleButton(interaction, guild, g) {
   const gid = guild.id;
   const uid = interaction.user.id;
@@ -1006,6 +1303,7 @@ async function handleButton(interaction, guild, g) {
   const L = mk(lang);
   const id = interaction.customId;
 
+  // ---- Boutons d'administration (brouillon de panel, mise à jour) ----
   if (id.startsWith('panel_') || id.startsWith('panelupdate_')) {
     if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), flags: MessageFlags.Ephemeral }); return; }
 
@@ -1083,9 +1381,11 @@ async function handleButton(interaction, guild, g) {
     return;
   }
 
+  // ---- Boutons des membres (panel) ----
   const blacklisted = !!g.blacklist[uid];
   const pids = panelProductIds(g, interaction);
 
+  // key_redeem / reset_hwid ouvrent une fenêtre : réponse immédiate sans defer
   if (id === 'key_redeem' || id === 'reset_hwid') {
     if (blacklisted) { await interaction.reply({ content: t(lang, 'msg_blacklisted'), flags: MessageFlags.Ephemeral }); return; }
     const isRedeem = id === 'key_redeem';
@@ -1125,6 +1425,7 @@ async function handleButton(interaction, guild, g) {
     const owned = findKeysByUser(g, uid).filter((k) => pids.has(k.productId));
     if (owned.length === 0) { await interaction.editReply({ content: t(lang, 'msg_no_key_owned') }); return; }
     if (owned.length === 1) {
+
       const deliveryRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`deliver_dm_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_dm')).setEmoji('📩').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`deliver_here_${owned[0].key}`).setLabel(t(lang, 'btn_deliver_here')).setEmoji('💬').setStyle(ButtonStyle.Secondary),
@@ -1180,6 +1481,8 @@ async function handleButton(interaction, guild, g) {
     return;
   }
 
+  // deliver_dm_<clé> / deliver_here_<clé> : choix fait par l'acheteur
+  // après avoir validé sa clé.
   if (id.startsWith('deliver_dm_') || id.startsWith('deliver_here_')) {
     await interaction.deferUpdate();
     const viaDm = id.startsWith('deliver_dm_');
@@ -1204,6 +1507,9 @@ async function handleButton(interaction, guild, g) {
   }
 }
 
+// ----------------------------------------------------------------
+// MENUS DÉROULANTS
+// ----------------------------------------------------------------
 async function handleSelect(interaction, guild, g) {
   const gid = guild.id;
   const uid = interaction.user.id;
@@ -1211,6 +1517,7 @@ async function handleSelect(interaction, guild, g) {
   const L = mk(lang);
   const id = interaction.customId;
 
+  // ---- Admin : brouillon de panel / choix du panel à mettre à jour ----
   if (id === 'panel_sel_buttons' || id === 'panel_sel_products' || id === 'select_panel_update') {
     if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), flags: MessageFlags.Ephemeral }); return; }
 
@@ -1234,6 +1541,7 @@ async function handleSelect(interaction, guild, g) {
     return;
   }
 
+  // ---- Membres ----
   if (g.blacklist[uid]) { await interaction.update({ content: t(lang, 'msg_blacklisted'), components: [] }); return; }
 
   if (id === 'select_view_script') {
@@ -1260,6 +1568,9 @@ async function handleSelect(interaction, guild, g) {
   }
 }
 
+// ----------------------------------------------------------------
+// FENÊTRES (MODALS)
+// ----------------------------------------------------------------
 async function handleModal(interaction, guild, g) {
   const gid = guild.id;
   const uid = interaction.user.id;
@@ -1267,6 +1578,7 @@ async function handleModal(interaction, guild, g) {
   const L = mk(lang);
   const id = interaction.customId;
 
+  // ---- Admin : ajout de produit ----
   if (id === 'modal_addproduct' || id === 'modal_quick_addproduct') {
     if (!canManage(interaction, guild, g)) { await interaction.reply({ content: noPermMsg(L), flags: MessageFlags.Ephemeral }); return; }
     const fromDraft = id === 'modal_quick_addproduct' && typeof interaction.isFromMessage === 'function' && interaction.isFromMessage();
@@ -1310,6 +1622,7 @@ async function handleModal(interaction, guild, g) {
     return;
   }
 
+  // ---- Membres ----
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const pids = panelProductIds(g, interaction);
 
@@ -1335,6 +1648,7 @@ async function handleModal(interaction, guild, g) {
     if (g.blacklist[uid]) { await interaction.editReply({ content: t(lang, 'msg_blacklisted') }); return; }
 
     const inputKey = interaction.fields.getTextInputValue('key_value').trim().toUpperCase();
+    // La clé doit exister DANS CE SERVEUR (et sur les produits de ce panel).
     const record = findKeyByValue(g, inputKey);
     if (!record || !pids.has(record.productId)) { await interaction.editReply({ content: t(lang, 'msg_invalid_key') }); return; }
     if (record.userId && record.userId !== uid) { await interaction.editReply({ content: t(lang, 'msg_key_owned_by_other') }); return; }
@@ -1361,16 +1675,21 @@ async function handleModal(interaction, guild, g) {
   }
 }
 
+// ----------------------------------------------------------------
+// ROUTEUR D'INTERACTIONS
+// ----------------------------------------------------------------
 async function routeInteraction(interaction) {
   const uid = interaction.user.id;
   const botOwner = isBotOwner(uid);
 
+  // Serveur désactivé par toi : on bloque tout, sauf pour toi (OWNER_ID).
   if (interaction.guildId && !botOwner && (db.getGlobal().disabledGuildIds || []).includes(interaction.guildId)) {
     if (interaction.isAutocomplete()) { await interaction.respond([]).catch(() => {}); return; }
     if (interaction.isRepliable()) await interaction.reply({ content: '❌ Ce bot est désactivé sur ce serveur. / This bot is disabled on this server.', flags: MessageFlags.Ephemeral }).catch(() => {});
     return;
   }
 
+  // Tes commandes à toi : marchent partout, sans /start.
   if (interaction.isChatInputCommand() && OWNER_CMDS.has(interaction.commandName)) { await handleOwnerCommand(interaction); return; }
 
   if (!interaction.guildId) {
@@ -1388,19 +1707,24 @@ async function routeInteraction(interaction) {
   const g = db.get(guild.id);
   const L = mk(g.config.language);
 
+  // /start et ses menus/boutons : la seule chose qui marche avant la config.
   if (interaction.isChatInputCommand() && interaction.commandName === 'start') { await handleStartCommand(interaction, guild); return; }
   if ((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('start_')) { await handleStartComponent(interaction, guild, g); return; }
 
+  // Tant que /start n'a pas été fait : plus rien ne marche.
   if (!g.setupDone) {
     if (interaction.isAutocomplete()) { await interaction.respond([]); return; }
     await interaction.reply({ content: NOT_CONFIGURED_MSG, flags: MessageFlags.Ephemeral });
     return;
   }
 
+  // Autocomplete produit
   if (interaction.isAutocomplete()) {
     if (!canManage(interaction, guild, g)) { await interaction.respond([]); return; }
     const focused = interaction.options.getFocused().toLowerCase();
     const choices = [];
+    
+    // Fast product lookup - only return if matches
     for (const [id, p] of Object.entries(g.products)) {
       if (choices.length >= 24) break;
       if (!p || !p.name) continue;
@@ -1408,12 +1732,14 @@ async function routeInteraction(interaction) {
         choices.push({ name: p.name, value: id });
       }
     }
+    
     if (interaction.commandName === 'killswitch') choices.unshift({ name: L('Tous les produits', 'All products'), value: 'tous' });
     await interaction.respond(choices.slice(0, 25)).catch(() => {});
     return;
   }
 
   if (interaction.isChatInputCommand()) {
+    // /permissions : uniquement le propriétaire du serveur (ou toi).
     if (interaction.commandName === 'permissions') {
       if (!(botOwner || isGuildOwner(interaction, guild))) {
         await interaction.reply({ content: L('❌ Seul le propriétaire du serveur peut gérer les permissions.', '❌ Only the server owner can manage permissions.'), flags: MessageFlags.Ephemeral });
@@ -1433,10 +1759,11 @@ async function routeInteraction(interaction) {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    await dbReadyPromise;
+    await dbReadyPromise; // ne jamais lire/écrire les données avant qu'elles soient chargées
     await routeInteraction(interaction);
   } catch (err) {
     if (err && err.code === 40060) {
+      // 40060 = "déjà répondu" : une AUTRE copie du bot a répondu avant nous.
       dup.count++; dup.lastAt = Date.now();
       console.warn('🚨 Une autre copie du bot répond aussi (Termux + Render ?). Arrête-en une !');
       return;
@@ -1451,16 +1778,64 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 (async () => {
+  // 1) Le petit serveur web démarre EN PREMIER, avant tout le reste. C'est
+  // lui que Render surveille pour savoir si l'app est vivante : s'il tarde
+  // (à cause de MongoDB lent/indisponible), Render tue et redémarre l'app en
+  // boucle, ce qui coupe le bot Discord en permanence. Il doit donc être
+  // ouvert immédiatement, indépendamment de MongoDB.
   require('./server');
 
   if (!process.env.DISCORD_TOKEN) console.error("❌ DISCORD_TOKEN manquant : ajoute-le dans les variables d'environnement.");
 
+  // 2) Connexion à Discord ET à MongoDB EN MÊME TEMPS (pas l'une après
+  // l'autre) : si Mongo est lent, ça ne retarde plus la connexion Discord.
+  // dbReadyPromise est attendue par le handler "ready" (voir plus haut) avant
+  // de synchroniser les serveurs, pour ne jamais agir sur des données pas
+  // encore chargées.
   client.login(process.env.DISCORD_TOKEN).catch((e) => console.error('❌ Connexion Discord impossible :', e.message));
   await dbReadyPromise;
 
+  // ----------------------------------------------------------------
+  // ANTI-MISE EN VEILLE (plan gratuit Render)
+  // ----------------------------------------------------------------
+  // Render éteint le service après ~15 min sans requête HTTP entrante, ce
+  // qui coupe aussi la connexion Discord du bot. On s'auto-appelle toutes
+  // les 10 minutes pour que ça n'arrive jamais.
   if (process.env.PUBLIC_URL) {
     setInterval(() => {
       https.get(`${process.env.PUBLIC_URL.replace(/\/$/, '')}/health`, (res) => { res.resume(); }).on('error', () => {});
     }, 10 * 60 * 1000);
+    console.log(`✅ Anti-sleep actif → ping /health toutes les 10min sur ${process.env.PUBLIC_URL}`);
+  } else {
+    console.warn(
+      '⚠️  PUBLIC_URL non défini → anti-sleep DÉSACTIVÉ.\n' +
+      '   Render va éteindre le bot après ~15min d\'inactivité.\n' +
+      '   → Ajoute PUBLIC_URL = https://ton-service.onrender.com dans les variables Render.'
+    );
+  }
+
+  // ----------------------------------------------------------------
+  // HEARTBEAT INSTANCE (prévention double-instance en continu)
+  // ----------------------------------------------------------------
+  // Met à jour le timestamp "je suis vivant" dans MongoDB toutes les 30s.
+  // Si une nouvelle instance démarre et voit ce heartbeat récent → elle s'arrête.
+  // Si une autre instance prend la main pendant qu'on tourne → on s'arrête aussi.
+  if (db.getStatus().persistent) {
+    setInterval(async () => {
+      try {
+        const glob = db.getGlobal();
+        const now = Date.now();
+        const other = glob.activeInstance;
+        // Une autre instance a pris la main et était active il y a moins de 60s → on cède.
+        if (other && other.id !== INSTANCE_ID && (now - (other.lastSeen || 0)) < 60000) {
+          console.error(
+            `🚨 Heartbeat : instance ${other.id} a pris la main. Arrêt de ${INSTANCE_ID}.`
+          );
+          process.exit(0);
+        }
+        glob.activeInstance = { id: INSTANCE_ID, startedAt: STARTED_AT, lastSeen: now };
+        await db.saveGlobal();
+      } catch (e) { /* heartbeat non-critique, on continue */ }
+    }, 30 * 1000);
   }
 })();
